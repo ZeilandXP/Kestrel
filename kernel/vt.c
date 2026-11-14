@@ -30,6 +30,7 @@
 struct vt {
     struct kestrel_tty *tty;
     int pty;
+    bool ready;                 /* vt_setup() done */
 };
 static struct vt vts[MAX_MONITORS];
 
@@ -128,14 +129,21 @@ static bool vt_setup(int index, struct vt *v)
     if (!out || !in) { kprintf("vt: %s: cannot start its threads\n", path); return false; }
     kprintf("vt: %s is a terminal (%d x %d), /dev/pts/%d underneath\n", path, v->tty->max_cols,
             v->tty->max_rows, v->pty);
+    v->ready = true;
     return true;
+}
+
+bool vt_start(int index)
+{
+    struct vt *v = &vts[index];
+    return v->ready || vt_setup(index, v);
 }
 
 void vt_session(int index)
 {
     struct vt *v = &vts[index];
     tty_bind_current(index);                            /* the shells inherit this TTY */
-    if (!vt_setup(index, v)) {
+    if (!vt_start(index)) {
         kprintf("vt: tty%d: no terminal, nothing runs on it\n", index + 1);
         for (;;) task_sleep_ms(1000000);
     }

@@ -167,7 +167,9 @@ struct int_frame;
 #define SYS_epoll_wait    232
 #define SYS_epoll_ctl     233
 #define SYS_openat        257
+#define SYS_mknod         133
 #define SYS_mkdirat       258
+#define SYS_mknodat       259
 #define SYS_newfstatat    262
 #define SYS_unlinkat      263
 #define SYS_faccessat     269

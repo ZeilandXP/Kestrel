@@ -83,8 +83,9 @@ orig() {    # PACKAGE DIR: noble's upstream tarball of PACKAGE, unpacked as DIR
     mkdir -p "$SRC/$2"
     tar -xf "$t" -C "$SRC/$2" --strip-components=1
 }
-step "BusyBox, IceWM, xterm"
+step "BusyBox, SysVinit, IceWM, xterm"
 orig busybox busybox
+orig sysvinit sysvinit
 orig icewm icewm
 orig xterm xterm
 
@@ -123,6 +124,7 @@ FW=$(ls "$SRC"/debs/linux-firmware-nvidia-graphics_*.deb | head -1)
 
 # ---- ports ---------------------------------------------------------------
 step "make busybox";  [ -f build/busybox-root/.stamp ] || make busybox BUSYBOX_SRC="$SRC/busybox"
+step "make sysvinit"; [ -f build/sysvinit-root/.stamp ] || make sysvinit SYSVINIT_SRC="$SRC/sysvinit"
 step "make xlibre";   [ -f build/xlibre-root/.stamp ]  || MAKEJ=$JOBS make xlibre XLIBRE_SRC="$SRC/xserver" XLIBRE_DEPS="$SRC/xdeps"
 step "make icewm";    [ -f build/icewm-root/.stamp ]   || make icewm ICEWM_SRC="$SRC/icewm"
 step "make xterm";    [ -f build/xterm-root/.stamp ]   || make xterm XTERM_SRC="$SRC/xterm"

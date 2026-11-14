@@ -18,4 +18,8 @@ bool vt_shell_available(void);
  * run it in a thread of its own (or as init on TTY 0). */
 void vt_session(int index) __attribute__((noreturn));
 
+/* Only the terminal, for programs to open (/dev/ttyN), with no shell on it:
+ * what SysVinit's getty lines need. Repeating it is harmless. */
+bool vt_start(int index);
+
 #endif

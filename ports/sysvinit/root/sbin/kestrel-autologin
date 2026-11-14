@@ -1,0 +1,4 @@
+#!/bin/sh
+# /sbin/kestrel-autologin: what getty runs on Kestrel's terminals (see
+# /etc/init.d/rcS): a login session for root, with no password asked.
+exec login -f root

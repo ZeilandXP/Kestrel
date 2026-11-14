@@ -24,7 +24,7 @@
 #define VFS_PATH_MAX 1024             /* a path given to a call, with its NUL */
 #define VFS_MAX_SYMLINKS 40           /* links followed in one lookup (ELOOP) */
 
-enum vtype { VNON = 0, VREG, VDIR, VCHR, VSOCK, VLNK };
+enum vtype { VNON = 0, VREG, VDIR, VCHR, VSOCK, VLNK, VFIFO };
 
 struct vnode;
 struct mount;
@@ -151,6 +151,8 @@ struct vnode {
     int         refs;               /* open files, lookups in progress and
                                        working directories on it (atomic);
                                        fs/vfs.c: VN_GONE once out of the tree */
+    bool        memonly;            /* a socket's name or a FIFO: in memory only, also in
+                                     * a disk's directory (no create/remove/rename hooks) */
     bool        unlinked;           /* removed from its directory: freed
                                        when the last reference goes        */
     bool        loaded;             /* directory: children read (refresh)  */
@@ -220,6 +222,7 @@ struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uin
  * (or shared, from a refresh: see vnode_ops.refresh). So do pseudo_dir and
  * pseudo_file below. */
 void          vfs_node_add(struct vnode *dir, struct vnode *child);
+struct vnode *vfs_symlink_node_new(struct mount *fs, const char *name, const char *target);   /* in memory */
 /* Take a child away again, from a refresh run with the lock held exclusively
  * (vnode_ops.stale); it is freed once nothing refers to it. */
 void          vfs_node_drop(struct vnode *dir, struct vnode *child);
@@ -316,6 +319,8 @@ uint64_t vfs_poll_deadline(struct file *f);     /* see vnode_ops.poll_deadline *
 bool     file_nolock(struct file *f);           /* see vnode_ops.nolock; false for NULL */
 struct file *vfs_file_new(struct vnode *vn, int flags);    /* refcnt 1 */
 int     pipe_create(struct file **rd, struct file **wr, int flags);   /* fs/pipe.c */
+extern const struct vnode_ops fifo_ops;                          /* a FIFO's node (fs/pipe.c) */
+int     vfs_mkfifo_at(struct vnode *base, const char *path, mode_t mode);   /* mknod(S_IFIFO) */
 void    vfs_close(struct file *f);                  /* drops one reference */
 int     vfs_flock(struct file *f, int op);          /* flock(2) LOCK_SH/EX/UN, LOCK_NB */
 /* fcntl byte-range locks (fs/lockf.c); kfl is a kernel copy of struct flock */

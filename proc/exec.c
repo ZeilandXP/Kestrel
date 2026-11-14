@@ -101,6 +101,7 @@ struct spawn_args {
     char  path[128];
     char  stdio[32];            /* device for fds 0-2 ("" = the caller's TTY) */
     bool  ctty;                 /* stdio is a terminal: make it the controlling one */
+    bool  init;                 /* pid 1: init's environment */
     int   argc;
     char *argv[EXEC_MAX_ARGS];
 };
@@ -430,7 +431,9 @@ static int process_main(void *arg)
     char *const envp[] = { KPATH, "HOME=/", "TERM=kestrel", "DISPLAY=:0", shell };
     char *const console_envp[] = { KPATH, "HOME=/root", "TERM=linux", shell, "USER=root", "LOGNAME=root" };
     struct exec_args ea = { a->argc, (int)(sizeof envp / sizeof *envp), a->argv, (char **)envp };
+    char *const init_envp[] = { KPATH, "HOME=/", "TERM=linux" };          /* what Linux gives init */
     if (a->ctty) { ea.envc = (int)(sizeof console_envp / sizeof *console_envp); ea.envp = (char **)console_envp; }
+    if (a->init) { ea.envc = (int)(sizeof init_envp / sizeof *init_envp); ea.envp = (char **)init_envp; }
     uint64_t entry = 0, sp = 0;
     t->user = true;                                     /* uaccess: copies target the user half */
     int rc = exec_load_image(t, a->path, &ea, &entry, &sp);
@@ -468,7 +471,7 @@ int exec_wait(int pid) { return task_wait(pid); }
 
 int exec_spawn(const char *path, int argc, char *const argv[]) { return exec_spawn_io(path, argc, argv, NULL); }
 
-static int spawn(const char *path, int argc, char *const argv[], const char *stdio, bool ctty)
+static int spawn(const char *path, int argc, char *const argv[], const char *stdio, bool ctty, bool init)
 {
     if (!path || argc < 1 || argc > EXEC_MAX_ARGS) return -EINVAL;
     struct stat st;
@@ -478,12 +481,14 @@ static int spawn(const char *path, int argc, char *const argv[], const char *std
     strlcpy(a->path, path, sizeof a->path);
     if (stdio) strlcpy(a->stdio, stdio, sizeof a->stdio);
     a->ctty = ctty;
+    a->init = init;
     a->argc = argc;
     for (int i = 0; i < argc; i++) {
         a->argv[i] = kstrdup(argv[i]);
         if (!a->argv[i]) { for (int j = 0; j < i; j++) kfree(a->argv[j]); kfree(a); return -ENOMEM; }
     }
     const char *name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+    if (init && !task_reserve_init()) { for (int i = 0; i < argc; i++) kfree(a->argv[i]); kfree(a); return -EBUSY; }
     struct tcb *t = task_create(name, process_main, a);
     if (!t) { for (int i = 0; i < argc; i++) kfree(a->argv[i]); kfree(a); return -EAGAIN; }
     return t->pid;
@@ -519,10 +524,16 @@ void exec_login_shell(char *out, size_t n)
 
 int exec_spawn_io(const char *path, int argc, char *const argv[], const char *stdio)
 {
-    return spawn(path, argc, argv, stdio, false);
+    return spawn(path, argc, argv, stdio, false, false);
 }
 
 int exec_spawn_tty(const char *path, int argc, char *const argv[], const char *tty)
 {
-    return spawn(path, argc, argv, tty, true);
+    return spawn(path, argc, argv, tty, true, false);
+}
+
+/* init as a program (SysVinit's /sbin/init): pid 1, on /dev/console */
+int exec_spawn_init(const char *path, int argc, char *const argv[])
+{
+    return spawn(path, argc, argv, "/dev/console", false, true);
 }

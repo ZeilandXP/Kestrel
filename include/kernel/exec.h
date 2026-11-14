@@ -28,6 +28,8 @@ int exec_spawn_io(const char *path, int argc, char *const argv[], const char *st
  * on it, and it becomes the controlling terminal of the new process, which
  * leads its own session. The environment says TERM=linux. */
 int exec_spawn_tty(const char *path, int argc, char *const argv[], const char *tty);
+/* init (pid 1) as a program, on /dev/console with Linux's environment for it */
+int exec_spawn_init(const char *path, int argc, char *const argv[]);
 /* root's login shell from /etc/passwd, else /bin/sh (the text terminals' and $SHELL) */
 void exec_login_shell(char *out, size_t n);
 

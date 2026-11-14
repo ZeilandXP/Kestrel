@@ -1,0 +1,9 @@
+#!/bin/sh
+# /etc/init.d/rc.local: runs /etc/rc.local, if there is one, last in run
+# levels 2 to 5
+case "$1" in
+start)
+    [ -x /etc/rc.local ] && /etc/rc.local
+    ;;
+esac
+exit 0

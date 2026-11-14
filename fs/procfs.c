@@ -369,6 +369,7 @@ struct pid_info {
     int        threads;
     uint64_t   shared_pending;
     uint64_t   rss;                 /* resident pages */
+    uint64_t   end_data;            /* where the heap starts: the end of the image */
 };
 
 static struct pid_info *pid_copy(void *ctx)
@@ -387,6 +388,7 @@ static struct pid_info *pid_copy(void *ctx)
     spin_unlock_irqrestore(&proc_lock, f);
     if (!t) { kfree(c); return NULL; }
     c->rss = mm ? mm->rss : 0;
+    c->end_data = mm ? mm->brk_start : 0;
     mm_put(mm);
     return c;
 }
@@ -407,7 +409,10 @@ static size_t gen_pid_stat(char *buf, size_t cap, void *ctx)
     P("%d (%s) %c %d %d %d %d -1 %u 0 0 0 0 %lu 0 0 0 20 0 %d 0 %lu %lu %lu",
       t->pid, t->name, state_char(t), t->ppid, t->pgid, t->sid, tty, t->user ? 0u : 0x200000u,
       ticks, c->threads, start, pages * 4096, pages);
-    P(" 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 %d\n", t->exit_code);
+    /* startcode and endcode: 0 only for kernel threads, which is how
+     * killall5 and ps tell them apart */
+    uint64_t ec = t->user ? c->end_data : 0, sc = !ec ? 0 : ec > UVM_IMAGE_BASE ? UVM_IMAGE_BASE : 0x400000;
+    P(" 18446744073709551615 %lu %lu 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 %d\n", sc, ec, t->exit_code);
     kfree(c);
     return n;
 }

@@ -145,6 +145,7 @@ struct stat {
 #define DT_REG     8
 #define DT_LNK     10
 #define DT_SOCK    12
+#define DT_FIFO    1
 struct linux_dirent64 {
     uint64_t d_ino;
     int64_t  d_off;

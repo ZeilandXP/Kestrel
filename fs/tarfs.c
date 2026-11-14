@@ -6,8 +6,8 @@
  * device that disappears later produces -EIO/-ENODEV on read instead of a
  * crash. Supported entries: regular files ('0', '\0'), directories ('5'),
  * hard links to earlier files ('1': another name for the same data, e.g.
- * busybox applets), GNU long names ('L'); pax headers, symbolic links and
- * devices are skipped. */
+ * busybox applets), symbolic links ('2'), GNU long names ('L'); pax headers
+ * and devices are skipped. */
 #include <kernel/tarfs.h>
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
@@ -176,8 +176,8 @@ int tarfs_mount(struct blkdev *dev, uint64_t offset, uint64_t length, const char
         }
 
         bool is_dir = h->typeflag == '5', is_file = h->typeflag == '0' || h->typeflag == 0;
-        bool is_link = h->typeflag == '1';
-        if (!is_dir && !is_file && !is_link) {
+        bool is_link = h->typeflag == '1', is_symlink = h->typeflag == '2';
+        if (!is_dir && !is_file && !is_link && !is_symlink) {
             if (h->typeflag != 'x' && h->typeflag != 'g')
                 kprintf("tarfs: skipping %s (type '%c')\n", name, h->typeflag);
             st.skipped++;
@@ -191,7 +191,15 @@ int tarfs_mount(struct blkdev *dev, uint64_t offset, uint64_t length, const char
 
         uint32_t mode = (uint32_t)octal(h->mode, sizeof h->mode) & 0777;
         struct vnode *vn = child(dir, leaf);
-        if (is_link) {
+        if (is_symlink) {
+            char target[101];
+            snprintf(target, sizeof target, "%.100s", h->linkname);
+            if (!vn) {
+                if (!(vn = vfs_symlink_node_new(m, leaf, target))) { rc = -ENOMEM; break; }
+                vfs_node_add(dir, vn);
+                st.files++;
+            }
+        } else if (is_link) {
             char target[101];
             snprintf(target, sizeof target, "%.100s", h->linkname);
             struct vnode *t = lookup_rel(root, target);

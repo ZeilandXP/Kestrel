@@ -731,6 +731,30 @@ static int64_t sys_mkdirat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_
 static int64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a3; (void)a4; (void)a5; (void)a6; return sys_mkdirat((uint64_t)(int64_t)AT_FDCWD, path, mode, 0, 0, 0); }
 
+/* mknod: FIFOs and regular files; device nodes are /dev's alone (EPERM) */
+static int64_t sys_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t dev, uint64_t a5, uint64_t a6)
+{
+    (void)dev; (void)a5; (void)a6;
+    uint32_t type = (uint32_t)mode & S_IFMT;
+    if (type && type != S_IFIFO && type != S_IFREG) {
+        if (type == S_IFCHR || type == S_IFBLK || type == S_IFSOCK) return -EPERM;
+        return -EINVAL;
+    }
+    AT_PATH(dirfd, path);
+    int r;
+    if (type == S_IFIFO) r = vfs_mkfifo_at(base, p, (mode_t)(mode & 07777));
+    else {
+        struct file *f;
+        r = vfs_open_at(base, p, O_CREAT | O_EXCL | O_WRONLY, (mode_t)(mode & 07777), &f);
+        if (r == 0) vfs_close(f);
+    }
+    fput(hold);
+    return r;
+}
+
+static int64_t sys_mknod(uint64_t path, uint64_t mode, uint64_t dev, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sys_mknodat((uint64_t)(int64_t)AT_FDCWD, path, mode, dev, 0, 0); }
+
 static int64_t sys_unlinkat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
@@ -1065,6 +1089,8 @@ static int64_t sys_uname(uint64_t p, uint64_t a2, uint64_t a3, uint64_t a4, uint
 }
 
 /* reboot(2): Linux-compatible magic numbers */
+bool g_cad_to_init;
+
 static int64_t sys_reboot(uint64_t m1, uint64_t m2, uint64_t cmd, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
@@ -1079,8 +1105,11 @@ static int64_t sys_reboot(uint64_t m1, uint64_t m2, uint64_t cmd, uint64_t a4, u
         power_off();
     case 0xCDEF0123u:                                   /* HALT */
         power_halt();
-    case 0x89ABCDEFu:                                   /* CAD_ON / CAD_OFF: Ctrl-Alt-Del is ours */
-    case 0x00000000u:
+    case 0x89ABCDEFu:                                   /* CAD_ON: Ctrl+Alt+Del resets the PC */
+        g_cad_to_init = false;
+        return 0;
+    case 0x00000000u:                                   /* CAD_OFF: it is SIGINT to init */
+        g_cad_to_init = true;
         return 0;
     }
     return -EINVAL;
@@ -3780,6 +3809,7 @@ void syscall_init(void)
     REG(SYS_gettimeofday, sys_gettimeofday);
     REG(SYS_pread64, sys_pread64);     REG(SYS_pwrite64, sys_pwrite64);
     REG(SYS_openat, sys_openat);       REG(SYS_newfstatat, sys_newfstatat);
+    REG(SYS_mknod, sys_mknod);         REG(SYS_mknodat, sys_mknodat);
     REG(SYS_unlinkat, sys_unlinkat);   REG(SYS_mkdirat, sys_mkdirat);
     REG(SYS_faccessat, sys_faccessat); REG(SYS_ppoll, sys_ppoll);
     REG(SYS_mremap, sys_mremap);       REG(SYS_msync, sys_msync);

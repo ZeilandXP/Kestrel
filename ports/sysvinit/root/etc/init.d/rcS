@@ -1,0 +1,38 @@
+#!/bin/sh
+# /etc/init.d/rcS: Kestrel's boot under SysVinit (its sysinit line)
+#
+# The kernel has already mounted /, /dev, /dev/pts, /proc and /sys, brought
+# up the network (DHCP) and made a terminal of every monitor. This sets up
+# what programs expect on top, runs /etc/rcS.d/S*, and gives each terminal
+# a getty line.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+grep -q " /run " /proc/mounts || mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mkdir -p /run/lock
+[ -e /var/run ] || ln -s /run /var/run
+[ -e /var/lock ] || ln -s /run/lock /var/lock
+: > /run/utmp
+[ -e /var/log/wtmp ] || : > /var/log/wtmp
+
+[ -f /etc/fstab ] && mount -a 2>/dev/null
+[ -s /etc/hostname ] && hostname -F /etc/hostname
+
+for s in /etc/rcS.d/S*; do
+    [ -x "$s" ] && "$s" start
+done
+
+# A getty on every terminal there is (tty1 is the first monitor), logging
+# root in: /sbin/kestrel-autologin. For a login prompt instead, drop
+# "-n -l /sbin/kestrel-autologin" here.
+mkdir -p /etc/inittab.d
+tab=/etc/inittab.d/ttys.tab
+: > "$tab.new"
+for t in /dev/tty[1-9] /dev/tty[1-9][0-9]; do
+    [ -c "$t" ] || continue
+    n=${t#/dev/tty}
+    echo "t$n:2345:respawn:/sbin/getty -n -l /sbin/kestrel-autologin 38400 tty$n" >> "$tab.new"
+done
+mv "$tab.new" "$tab"
+kill -HUP 1                     # init reads the getty lines again
+exit 0

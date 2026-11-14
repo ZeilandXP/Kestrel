@@ -1,0 +1,16 @@
+#!/bin/sh
+# /etc/init.d/rc N: enter run level N (its "wait" line in /etc/inittab)
+#
+# Stops what /etc/rcN.d/K* names, then starts what /etc/rcN.d/S* names, in
+# the order of their names.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+level=$1
+[ -n "$level" ] || { echo "usage: rc RUNLEVEL" >&2; exit 1; }
+for s in /etc/rc$level.d/K*; do
+    [ -x "$s" ] && "$s" stop
+done
+for s in /etc/rc$level.d/S*; do
+    [ -x "$s" ] && "$s" start
+done
+exit 0
