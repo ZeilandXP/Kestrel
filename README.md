@@ -13,7 +13,7 @@ Because I want to prove that vibe-coding operating systems isn't always a bad id
 
 ## Overview
 
-Kestrel (0.3.8, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
+Kestrel (0.3.9, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
 
 Tested in QEMU 9.2 with three boot paths:
 - legacy BIOS from the ISO, using a VBE frame buffer
@@ -215,7 +215,7 @@ Each utility is a separate `int name_main(struct cu_io *io, int argc, char **arg
 | `echo [-n] [-e\|-E]` | Escapes `\n \t \\ \a \b \e \f \r \v \0NNN \c` |
 | `chmod MODE`, `chown USER[:GROUP]` | Octal (`755`) or symbolic (`u+x,go-w`) modes. Names come from `/etc/passwd` and `/etc/group`, or numbers. |
 | `date [+FORMAT]` | The CMOS RTC is read at boot and advanced by the kernel's clock (TSC or HPET). Kestrel has no time zones, so the time is UTC. |
-| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.8`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
+| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.9`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
 | `neofetch` | A falcon in columns 2–28 (silver) and live system information from column 32, never past column 127 (no wrapping). Below it, the 16-colour strip. |
 
 `neofetch` reads every value at run time from these sources:
@@ -528,7 +528,7 @@ Tested in QEMU (q35, `qemu-xhci`, `usb-storage`) for each of these situations:
 
 **Install Kestrel** on the desktop (or `kestrel-install` as root on a text terminal) puts Kestrel on a disk of the PC, from the stick, from the ISO (also when Ventoy started it) or from an installed Kestrel. It is a full-screen program in the steps of Ubuntu's installer; Esc goes back a step, and nothing is written before the last one, which lists every change and asks to confirm:
 
-1. **Welcome**: Install Kestrel, or Try Kestrel (leave the installer).
+1. **Welcome**: Install Kestrel, or Try Kestrel (leave the installer). When a Kestrel is installed on the PC already, it also offers to update it (below).
 2. **Keyboard**: English (US), English (UK), German, French (AZERTY), Spanish or Italian. The layout applies at once (on the text terminals through `/proc/sys/kernel/keymap`, on the desktop with `setxkbmap`), with a field to try it.
 3. **Installation type**: *Erase disk and install Kestrel*; *Install Kestrel alongside* the systems it found (Windows, Linux, another Kestrel); or *Something else*.
 4. **Disk**: the disk to erase; the free space to use; or, for something else, also the whole disk or a partition to replace (with the free space around it), then the size of Kestrel's file system.
@@ -536,14 +536,15 @@ Tested in QEMU (q35, `qemu-xhci`, `usb-storage`) for each of these situations:
 6. **Who are you?**: your name, the computer's name, a username and a password (root gets the same one), then *Log in automatically* or *Require my password to log in*.
 7. **Write the changes to disks?**, the progress, and *Restart now* or *Continue testing*. The log is `/var/log/kestrel-install.log` (and on the installed system too).
 
-Kestrel takes three partitions: an EFI System Partition (256 MiB, FAT32: GRUB for UEFI, the kernel as `boot/kernel-a.elf`, and `boot/grub/local.cfg` with this system's settings), the boot volume (two slots of three times the volume's size, at least 512 MiB each, for the updater) and the ext2 root (`kestrel-root`, made with BusyBox's `mke2fs`, the rest of the space). GRUB goes into the MBR and the sectors before the first partition. Alongside other systems the three are primary partitions if the table has three free entries, else logical ones in a new extended partition; the other partitions stay as they are.
+Kestrel takes three partitions: an EFI System Partition (256 MiB, FAT32: GRUB for UEFI, the kernel as `boot/kernel-a.elf` and `boot/kernel-b.elf` (one for each boot volume slot), and `boot/grub/local.cfg` with this system's settings), the boot volume (two slots of three times the volume's size, at least 512 MiB each, for the updater) and the ext2 root (`kestrel-root`, made with BusyBox's `mke2fs`, the rest of the space). GRUB goes into the MBR and the sectors before the first partition. Alongside other systems the three are primary partitions if the table has three free entries, else logical ones in a new extended partition; the other partitions stay as they are.
 
-What it installs comes from the running system: GRUB's images for installed systems and the kernel from `/boot/share/kestrel/boot` (`make` builds them), the boot volume copied from its device (`/proc/bootvol`; on the ISO the module's RAM disk) with a new UUID, and the root's files (the root file system's, or the boot volume's when the root is in memory) with their owners, modes, times and hard links. The account, host name, time zone (`/etc/localtime`), keyboard (`/etc/default/keyboard`) and login setting (`/etc/default/kestrel`) are then written into the new root.
+What it installs comes from the running system: GRUB's images for installed systems and the kernel from `/boot/share/kestrel/boot` (`make` builds them), the boot volume copied from its device (`/proc/bootvol`; on the ISO the module's RAM disk) with a new UUID, and the root's files (the root file system's, or the boot volume's when the root is in memory) with their owners, modes, times and hard links; their list, with each file's CRC, size and time, is kept as `/var/lib/kestrel/files` for the updater. The account, host name, time zone (`/etc/localtime`), keyboard (`/etc/default/keyboard`) and login setting (`/etc/default/kestrel`) are then written into the new root.
 
 The installed system starts by BIOS and by UEFI. Its GRUB menu has the desktop and text-console entries, then the other systems on the PC's disks: Windows through its boot loader (`bootmgr` on BIOS, `bootmgfw.efi` on UEFI) and Linux through its own GRUB menu. The desktop's X server runs as root and the desktop as your account: started by itself with *Log in automatically*, else after a login in a window, which comes back when you log out; the text terminals log you in, or ask for the password.
 
 ```
-kestrel-install --list           the disks, their partitions, and what each offers
+kestrel-install --list           the disks, their partitions, what each offers, installed systems
+kestrel-install --update [DISK]  update the Kestrel installed on DISK (also: kestrel-update DISK)
 kestrel-install --auto FILE      no questions; FILE has key=value lines:
     mode=erase | something       disk=sata0      region=N (a free space from --list)
     replace=N (a primary partition)              root_mib=N
@@ -555,9 +556,22 @@ Beta limits: MBR partition tables only (a GPT disk can only be erased: installin
 
 Tested in QEMU (q35), each installation then started from its disk alone: erasing a blank disk from the stick under SeaBIOS and under OVMF; alongside a disk with a FAT partition holding `bootmgr` and an ext4 Linux with its GRUB menu (logical partitions; GRUB lists both and opens the Linux menu); replacing that Linux partition (something else, primary partitions); from the ISO; and from the ISO started by Ventoy 1.0.99, under SeaBIOS and under OVMF. Password login on the terminals, automatic login as the new user, the UK and German layouts and the time zone checked on the installed systems; with the stick plugged in as well, the stick starts its own kernel and root.
 
+### Updating an installed Kestrel
+
+A Kestrel installed on a disk is updated from the next release's stick or ISO (Ventoy too): its installer's Welcome screen offers *Update Kestrel 0.3.9 on sata0 to 0.3.10* (or *Reinstall* for the same release; a newer installed release is not offered), shows what stays, and asks to confirm. `kestrel-install --update DISK` does the same without questions. The installed system is found by its EFI System Partition's `boot/grub/local.cfg`, which names its release, slot and boot volume UUID; its boot volume and root are the next Kestrel partitions after it on the disk. The update (`user/install/update.c`):
+
+1. writes the new boot volume into the partition's other slot (the header last, with a new UUID) and the new kernel into that slot's `kernel-a.elf` or `kernel-b.elf`;
+2. updates the root's files: the release's files replace the installed ones (each unlinked first, so a running program keeps its copy), except below `/home`, `/root`, `/var/log`, `/var/spool`, `/var/mail`, `/srv` and `/usr/local`. A settings file in `/etc` that you changed stays; if the release changes it too, its version is written beside yours as `<file>.kestrel-new` and listed at the end. A file you deleted from `/etc` stays deleted. `/etc/passwd`, `/etc/group` and `/etc/shadow` keep your accounts and get the release's new system accounts. Files the old release had and the new one has not are removed, unless you changed them. What changed is known from `/var/lib/kestrel/files`, the list of what the old release installed;
+3. updates GRUB (only when its images differ) and `BOOTX64.EFI`;
+4. rewrites `local.cfg`, one 512-byte sector, to start the new slot. Until this last step the old release starts, so an update cut short leaves a system that still starts (running the update again finishes it).
+
+The old release's kernel and boot volume stay in the other slot until the next update: GRUB lists them as *Kestrel 0.3.9 (the previous version)*, with the updated files on the root, to start the system if the new kernel does not. `/etc/kestrel/installed` records the release and when it was updated; the update's log is `/var/log/kestrel-update.log` on the installed system.
+
+Tested in QEMU (q35): 0.3.8 installed from its ISO, files changed in `/etc` and `/home`, then updated from the 0.3.9 ISO (changed and unchanged settings files, a file changed on both sides, removed files, accounts), started from the disk under SeaBIOS and OVMF, the previous version's entry started under SeaBIOS; then updated again from the full-screen installer (slot b back to slot a).
+
 ### The ISO through Ventoy
 
-The ISO boots from a Ventoy stick in Ventoy's normal mode, BIOS and UEFI: GRUB on the ISO loads the kernel and the boot volume as Multiboot2 modules, and the boot volume becomes `/dev/ram0`, so nothing needs to find the ISO file again.
+The ISO boots from a Ventoy stick in Ventoy's normal mode, BIOS and UEFI: GRUB on the ISO loads the kernel and the boot volume as Multiboot2 modules, and the boot volume becomes `/dev/ram0`, so nothing needs to find the ISO file again. The ISO's kernel takes that RAM disk before any boot volume on the PC's disks, and runs from memory: a Kestrel installed on the PC is neither its boot volume nor its root (so that the installer can update it).
 
 ### Keyboard layouts
 
@@ -706,7 +720,8 @@ ports/xterm/                 xterm build and its musl patch
 rootfs/                      contents of the boot volume payload
 user/install/                kestrel-install, the installer (beta): ui.c text interface, disk.c
                              disks and partition tables, fat.c the EFI partition, copy.c files,
-                             setup.c accounts and settings, install.c the steps
+                             setup.c accounts and settings, install.c the steps,
+                             update.c the updater
 ui/bootmgr.c                 boot manager, F8 screen, tools
 linuxkpi/                    the Linux KPI: build unmodified Linux drivers (see "Linux drivers")
   include/linux/ asm/ uapi/  the KPI's own Linux API headers (written here, none copied from Linux)
@@ -1064,7 +1079,7 @@ Together with `libctest`, `proctest`, `ptytest`, `socktest` and the shell script
 - Only the volume chosen this way is ever written. Other Linux file systems on the machine are left alone.
 
 Boot options:
-- `kestrel.rootfs=auto` (default): the volume labelled `kestrel-root`.
+- `kestrel.rootfs=auto` (default): the volume labelled `kestrel-root`, on the boot volume's disk first; none when the boot volume is a RAM disk (the ISO), which stays on the in-memory root.
 - `kestrel.rootfs=LABEL=<name>`: the ext2 volume with that label.
 - `kestrel.rootfs=<device>`, e.g. `sata0p2`: that partition or disk.
 - `kestrel.rootfs=none`: stay on the in-memory root.
@@ -1565,9 +1580,9 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 | 0.3.8 | Vulkan: Mesa's Vulkan drivers (lavapipe in software, NVK on nouveau, Venus on virtio-gpu) and what the kernel needs for them |
 | 0.3.9 | Sandboxes back on: seccomp-bpf and namespaces, so Firefox runs with its sandboxes; an installer that puts Kestrel on a hard drive or SSD; an updater that moves an installed system to the next release (0.3.9 to 0.3.10); SysVinit as the init system |
 | 0.3.10 | Smaller gaps: IPv6, MSI for network cards, ext4 extents, job control, sound capture and mixing |
-| 0.3.11 | File systems: full read-write NTFS, FAT12, FAT16 and FAT32, and full read-write ext3 and ext4 (journal included); USB tethering: RNDIS, CDC ECM and CDC NCM network adapters (Android tethering and USB Ethernet adapters) |
-| 0.3.12 | A much more complete LXDE desktop |
-| 0.3.13 | Kept free for an emergency release |
+| 0.3.11 | LXDE fully featured |
+| 0.3.12 | Firefox updated to the latest stable version |
+| 0.3.13 | Kept free for an emergency release, only if needed |
 | 0.4.0 | The 0.4 release |
 
 ## Licenses

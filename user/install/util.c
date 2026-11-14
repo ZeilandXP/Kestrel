@@ -94,3 +94,12 @@ int run(const char *const argv[], char *out, size_t cap)
     ilog("ran %s-> %d%s%s", line, code, out && *out ? ": " : "", out ? out : "");
     return code;
 }
+
+uint32_t crc32z(uint32_t crc, const uint8_t *b, size_t n)
+{
+    static uint32_t t[256];
+    if (!t[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1; t[i] = c; }
+    crc = ~crc;
+    while (n--) crc = t[(crc ^ *b++) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}

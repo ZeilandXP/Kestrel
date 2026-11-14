@@ -47,8 +47,11 @@ static bool cmdline_get(const char *key, char *out, size_t cap)
 
 /* The volume labelled `want`: on the boot volume's own disk first (a stick
  * plugged into a PC that has Kestrel installed takes its own root), then
- * on any disk. */
-static struct blkdev *find_label(const char *want)
+ * on any disk; but not when the boot volume is a RAM disk (the ISO, also
+ * through Ventoy): that one runs from memory, and a Kestrel installed on
+ * the PC is not its root (the installer may be about to update it),
+ * unless kestrel.rootfs=LABEL= asks for it. */
+static struct blkdev *find_label(const char *want, bool asked)
 {
     for (int i = 0; i < blk_count(); i++) {             /* partition tables first */
         struct blkdev *b = blk_get(i);
@@ -57,7 +60,8 @@ static struct blkdev *find_label(const char *want)
     const struct bootvol_status *bv = bootvol_status();
     struct blkdev *bvdev = bv->device[0] ? blk_find(bv->device) : NULL;
     struct blkdev *home = bvdev ? blk_disk_of(bvdev) : NULL;
-    for (int pass = home ? 0 : 1; pass < 2; pass++)
+    int last = home && home->kind == BLK_DISK_RAM && !asked ? 1 : 2;
+    for (int pass = home ? 0 : 1; pass < last; pass++)
         for (int i = 0; i < blk_count(); i++) {
             struct blkdev *b = blk_get(i);
             char label[17];
@@ -109,8 +113,8 @@ int rootfs_mount(void)
     root_dev[0] = 0;
 
     struct blkdev *dev;
-    if (!strcmp(v, "auto")) dev = find_label(DEFAULT_LABEL);
-    else if (!strncmp(v, "LABEL=", 6)) dev = find_label(v + 6);
+    if (!strcmp(v, "auto")) dev = find_label(DEFAULT_LABEL, false);
+    else if (!strncmp(v, "LABEL=", 6)) dev = find_label(v + 6, true);
     else {
         dev = blk_find(v);
         if (dev && !ext2_probe(dev, NULL)) { kprintf("rootfs: /dev/%s has no ext2 file system\n", v); return -EINVAL; }

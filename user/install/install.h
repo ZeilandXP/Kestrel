@@ -14,6 +14,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <stdio.h>
+
+struct stat;
 
 #define MIB             (1024ull * 1024)
 #define SECTOR          512u
@@ -136,6 +139,20 @@ typedef void (*copy_cb)(const struct copy_progress *p, void *ctx);
 uint64_t tree_size(const char *src, const char *const *skip, uint64_t *files);
 int copy_tree(const char *src, const char *dst, const char *const *skip, copy_cb cb, void *ctx,
               char *err, size_t errcap);
+enum copy_action { CA_COPY, CA_SKIP, CA_NEW };  /* CA_NEW: as <path>.kestrel-new */
+struct copy_opts {
+    const char *const *skip;
+    copy_cb cb;
+    void *ctx;
+    bool replace;               /* the target has files: replace them */
+    /* regular files: what to do with src (rel is "/etc/passwd"); may set
+     * *crc and *have_crc when it read the file */
+    enum copy_action (*decide)(const char *rel, const char *src, const char *dst, const struct stat *st,
+                               uint32_t *crc, bool *have_crc, void *ctx);
+    FILE *manifest;
+};
+int copy_tree_opts(const char *src, const char *dst, const struct copy_opts *o, char *err, size_t errcap);
+int file_crc(const char *path, uint32_t *crc, uint64_t *size);
 
 /* ---- setup.c ------------------------------------------------------------- */
 struct tz { const char *name, *posix; };
@@ -153,10 +170,56 @@ int setup_system(const char *root, const struct settings *s, char *err, size_t e
 int write_file(const char *path, const char *text, mode_t mode);
 char *read_file(const char *path, size_t *len);
 
+/* ---- install.c, shared with update.c --------------------------------------- */
+#define IMAGES          "/boot/share/kestrel/boot"      /* GRUB's images, the kernel */
+#define TARGET          "/mnt/kestrel-target"           /* the root being written */
+#define LOG             "/var/log/kestrel-install.log"
+#define MANIFEST        "/var/lib/kestrel/files"        /* in the installed root */
+#define MANIFEST_TMP    "/tmp/kestrel-files.new"
+extern char version[32];                        /* the running Kestrel's */
+extern char boot_src[32];                       /* the running boot volume's device */
+extern uint64_t boot_src_block, boot_vol_bytes;
+extern const char *root_src;                    /* the files to install */
+extern bool ui_on;
+extern const char *progress_heading;
+int  sources(char *err, size_t cap);
+const char **skip_list(void);
+void begin(const char *what, double lo, double hi);
+void progress(double f, const char *detail);
+void copy_progress(const struct copy_progress *p, void *ctx);
+void uuid_str(const uint8_t u[16], char *out);
+int  copy_bootvol(const char *dev, int slot, uint8_t uuid[16], char *err, size_t cap);
+struct boot_cfg {
+    char version[32];
+    char slot;                  /* 'a' or 'b' */
+    char uuid[40];
+    char keymap[16];
+    int timeout;
+    char prev_slot;             /* 0: no previous version */
+    char prev_uuid[40], prev_version[32];
+};
+int  esp_cfg(char cfg[512], const struct boot_cfg *b);
+int  write_grub(const char *disk, uint64_t first_part, uint64_t boot_start, char *err, size_t cap);
+void save_manifest(const char *root);           /* MANIFEST_TMP into root's MANIFEST */
+
+/* ---- update.c ------------------------------------------------------------ */
+struct installed {
+    struct disk *disk;
+    struct part *esp, *bootv, *root;
+    char version[32];
+    struct boot_cfg cfg;        /* its local.cfg as it is */
+};
+int  find_installed(struct disk *d, int nd, struct installed *out, int max);
+int  version_cmp(const char *a, const char *b);
+int  do_update(struct installed *in, char *err, size_t cap);
+int  update_main(struct disk *d, int nd, int argc, char **argv);
+bool step_update(struct installed *in);        /* full screen: confirm, update, done */
+
 /* ---- helpers ------------------------------------------------------------- */
 void ilog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_open(const char *path);
 void random_bytes(void *buf, size_t n);
+uint32_t crc32z(uint32_t crc, const uint8_t *b, size_t n);
 int  run(const char *const argv[], char *out, size_t cap);   /* exit status, or -1 */
 
 #endif

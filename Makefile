@@ -522,6 +522,7 @@ $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) u
 	@if [ -f $(INSTALL_BOOT)/.stamp ]; then mkdir -p $(ROOTFS_STAGE)/share/kestrel/boot && \
 	    cp $(INSTALL_BOOT)/boot.img $(INSTALL_BOOT)/core.img $(INSTALL_BOOT)/kernel.elf $(ROOTFS_STAGE)/share/kestrel/boot/ && \
 	    if [ -f $(INSTALL_BOOT)/bootx64.efi ]; then cp $(INSTALL_BOOT)/bootx64.efi $(ROOTFS_STAGE)/share/kestrel/boot/; fi; fi
+	@if [ -f $(ROOTFS_STAGE)/bin/kestrel-install ]; then ln -sf kestrel-install $(ROOTFS_STAGE)/bin/kestrel-update; fi
 	@install -m 755 user/shtest.sh $(ROOTFS_STAGE)/bin/shtest.sh
 	@chmod 4755 $(ROOTFS_STAGE)/bin/fusermount3   # libfuse looks for a setuid one
 	@ln -sf fusermount3 $(ROOTFS_STAGE)/bin/fusermount
