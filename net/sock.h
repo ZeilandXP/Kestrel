@@ -29,6 +29,11 @@ struct isock {
     /* stream sockets */
     struct tcpcb *tcb;
     struct isock *next;                 /* all datagram sockets (udp.c) */
+    /* made in a network namespace of its own (kernel/ns.c): that namespace
+     * has no interfaces up, so the socket is never handed to the stack --
+     * it can be bound to a port on "any address" and listened on, and
+     * nothing ever reaches it */
+    bool     isolated, listening;
 };
 
 static inline struct isock *isk(struct file *f) { return f->vn->data; }

@@ -17,6 +17,7 @@
  * Everything is under one spinlock; mapping and unmapping happen outside
  * it, on a reference taken under it. */
 #include <kernel/sysvshm.h>
+#include <kernel/ns.h>
 #include <kernel/spinlock.h>
 #include <kernel/task.h>
 #include <kernel/vm.h>
@@ -60,6 +61,7 @@ struct shmseg {
     struct vm_object *obj;
     int64_t  atime, dtime, ctime;
     int      cpid, lpid;
+    uint64_t ns;                        /* its IPC namespace (ns.h); 0: the initial one */
 };
 
 /* struct ipc64_perm and struct shmid64_ds, x86_64 */
@@ -85,12 +87,15 @@ static struct spinlock shm_lock;
 
 static int seg_id(int slot) { return (int)segs[slot]->seq * SHM_SLOTS + slot; }
 
+/* Slot s holds a segment of the caller's IPC namespace (lock held) */
+static bool mine(int s) { return segs[s] && segs[s]->ns == ipcns_id(current_task()); }
+
 /* The segment with this id (lock held), or NULL */
 static struct shmseg *by_id(int id, int *slot)
 {
     if (id < 0) return NULL;
     int s = id % SHM_SLOTS;
-    if (!segs[s] || segs[s]->seq != (uint16_t)(id / SHM_SLOTS)) return NULL;
+    if (!mine(s) || segs[s]->seq != (uint16_t)(id / SHM_SLOTS)) return NULL;
     if (slot) *slot = s;
     return segs[s];
 }
@@ -101,11 +106,11 @@ static uint64_t attached(const struct shmseg *g)
     return refs > 1 ? (uint64_t)(refs - 1) : 0;
 }
 
-/* May the caller use the segment (read: 4, write: 2)? root may. */
+/* May the caller use the segment (read: 4, write: 2)? CAP_IPC_OWNER may. */
 static bool allowed(const struct shmseg *g, unsigned want)
 {
     struct tcb *t = current_task();
-    if (t->uid == 0) return true;
+    if (ns_capable(NULL, CAP_IPC_OWNER)) return true;
     unsigned bits = g->mode;
     if (t->uid == g->uid || t->uid == g->cuid) bits >>= 6;
     else if (t->gid == g->gid || t->gid == g->cgid) bits >>= 3;
@@ -115,7 +120,7 @@ static bool allowed(const struct shmseg *g, unsigned want)
 static bool owner(const struct shmseg *g)
 {
     struct tcb *t = current_task();
-    return t->uid == 0 || t->uid == g->uid || t->uid == g->cuid;
+    return ns_capable(NULL, CAP_SYS_ADMIN) || t->uid == g->uid || t->uid == g->cuid;
 }
 
 /* Free slot s (lock held); its object goes with the caller's put. */
@@ -149,7 +154,7 @@ int64_t sysv_shmget(int32_t key, uint64_t size, int flags)
     if (key != IPC_PRIVATE) {
         for (int s = 0; s < SHM_SLOTS; s++) {
             struct shmseg *g = segs[s];
-            if (!g || g->removed || g->key != key) continue;
+            if (!mine(s) || g->removed || g->key != key) continue;
             int64_t r;
             if ((flags & IPC_CREAT) && (flags & IPC_EXCL)) r = -EEXIST;
             else if (size > g->size) r = -EINVAL;
@@ -175,13 +180,14 @@ int64_t sysv_shmget(int32_t key, uint64_t size, int flags)
     g->obj = o;
     g->ctime = time_realtime_sec();
     g->cpid = t->tgid;
+    g->ns = ipcns_id(t);
 
     f = spin_lock_irqsave(&shm_lock);
     int slot = -1;
     for (int s = 0; s < SHM_SLOTS && slot < 0; s++) if (!segs[s]) slot = s;
     /* a racing shmget may have made the key meanwhile */
     for (int s = 0; key != IPC_PRIVATE && s < SHM_SLOTS; s++)
-        if (segs[s] && !segs[s]->removed && segs[s]->key == key) { slot = -2; break; }
+        if (mine(s) && !segs[s]->removed && segs[s]->key == key) { slot = -2; break; }
     if (slot < 0) {
         spin_unlock_irqrestore(&shm_lock, f);
         o->last_user = NULL;
@@ -257,8 +263,9 @@ static void fill_ds(const struct shmseg *g, int id, struct shmid64_ds *ds)
 {
     memset(ds, 0, sizeof *ds);
     ds->perm.key = g->removed ? IPC_PRIVATE : g->key;
-    ds->perm.uid = g->uid;  ds->perm.gid = g->gid;
-    ds->perm.cuid = g->cuid; ds->perm.cgid = g->cgid;
+    struct tcb *t = current_task();
+    ds->perm.uid = uid_view(t, g->uid);   ds->perm.gid = gid_view(t, g->gid);
+    ds->perm.cuid = uid_view(t, g->cuid); ds->perm.cgid = gid_view(t, g->cgid);
     ds->perm.mode = g->mode | (g->removed ? 01000 : 0);    /* SHM_DEST */
     ds->perm.seq = (uint16_t)(id / SHM_SLOTS);
     ds->segsz = g->size;
@@ -280,7 +287,7 @@ int64_t sysv_shmctl(int id, int cmd, uint64_t ubuf)
                                 .shmall = SHM_MAX / UVM_PAGE };
         int high = 0;
         f = spin_lock_irqsave(&shm_lock);
-        for (int s = 0; s < SHM_SLOTS; s++) if (segs[s]) high = s;
+        for (int s = 0; s < SHM_SLOTS; s++) if (mine(s)) high = s;
         spin_unlock_irqrestore(&shm_lock, f);
         return copy_to_user((void *)ubuf, &si, sizeof si) ? -EFAULT : high;
     }
@@ -289,7 +296,7 @@ int64_t sysv_shmctl(int id, int cmd, uint64_t ubuf)
         int high = 0;
         f = spin_lock_irqsave(&shm_lock);
         for (int s = 0; s < SHM_SLOTS; s++) {
-            if (!segs[s]) continue;
+            if (!mine(s)) continue;
             high = s;
             si.used_ids++;
             si.shm_tot += (segs[s]->size + UVM_PAGE - 1) / UVM_PAGE;
@@ -302,7 +309,7 @@ int64_t sysv_shmctl(int id, int cmd, uint64_t ubuf)
         f = spin_lock_irqsave(&shm_lock);
         struct shmseg *g;
         if (cmd == IPC_STAT) g = by_id(id, &slot);
-        else { slot = id; g = id >= 0 && id < SHM_SLOTS ? segs[id] : NULL; }
+        else { slot = id; g = id >= 0 && id < SHM_SLOTS && mine(id) ? segs[id] : NULL; }
         if (!g) { spin_unlock_irqrestore(&shm_lock, f); return -EINVAL; }
         if (cmd != SHM_STAT_ANY && !allowed(g, 4)) { spin_unlock_irqrestore(&shm_lock, f); return -EACCES; }
         int rid = seg_id(slot);
@@ -316,11 +323,12 @@ int64_t sysv_shmctl(int id, int cmd, uint64_t ubuf)
         f = spin_lock_irqsave(&shm_lock);
         struct shmseg *g = by_id(id, NULL);
         int64_t r = 0;
-        if (!g) r = -EINVAL;
+        int64_t ku = uid_kernel(current_task(), ds.perm.uid), kg = gid_kernel(current_task(), ds.perm.gid);
+        if (!g || ku < 0 || kg < 0) r = -EINVAL;
         else if (!owner(g)) r = -EPERM;
         else {
-            g->uid = ds.perm.uid;
-            g->gid = ds.perm.gid;
+            g->uid = (uint32_t)ku;
+            g->gid = (uint32_t)kg;
             g->mode = ds.perm.mode & 0777;
             g->ctime = time_realtime_sec();
         }
@@ -363,7 +371,7 @@ size_t sysv_shm_proc(char *buf, size_t cap)
     uint64_t f = spin_lock_irqsave(&shm_lock);
     for (int s = 0; s < SHM_SLOTS && n < cap; s++) {
         struct shmseg *g = segs[s];
-        if (!g) continue;
+        if (!mine(s)) continue;
         P("%10d %10d  %4o %21lu %5d %5d  %5lu %5u %5u %5u %5u %10ld %10ld %10ld %21lu %21u\n",
           g->removed ? 0 : g->key, seg_id(s), g->mode | (g->removed ? 01000 : 0), g->size, g->cpid, g->lpid,
           attached(g), g->uid, g->gid, g->cuid, g->cgid, g->atime, g->dtime, g->ctime,
@@ -372,4 +380,24 @@ size_t sysv_shm_proc(char *buf, size_t cap)
     spin_unlock_irqrestore(&shm_lock, f);
 #undef P
     return n < cap ? n : cap;
+}
+
+/* An IPC namespace went away: its segments are removed, and go when their
+ * last attachment does. */
+void sysv_shm_ns_gone(uint64_t ns)
+{
+    if (!ns) return;
+    struct vm_object *dead[16];
+    for (int base = 0; base < SHM_SLOTS;) {
+        int nd = 0;
+        uint64_t f = spin_lock_irqsave(&shm_lock);
+        for (; base < SHM_SLOTS && nd < 16; base++) {
+            struct shmseg *g = segs[base];
+            if (!g || g->ns != ns) continue;
+            g->removed = true;
+            if (__atomic_load_n(&g->obj->refs, __ATOMIC_ACQUIRE) == 1) dead[nd++] = release(base);
+        }
+        spin_unlock_irqrestore(&shm_lock, f);
+        for (int i = 0; i < nd; i++) vmobj_put(dead[i]);
+    }
 }

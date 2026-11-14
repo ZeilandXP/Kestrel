@@ -42,6 +42,7 @@
 #include <kernel/process.h>
 #include <kernel/socket.h>
 #include <kernel/vfs.h>
+#include <kernel/ns.h>
 #include <kernel/task.h>
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
@@ -95,6 +96,7 @@ static struct {
     uint64_t ino;                       /* path names: VSOCK node inode */
     char     name[UNIX_PATH_MAX];       /* abstract names (without the leading 0) */
     uint32_t namelen;
+    uint64_t net;                       /* abstract names: the network namespace's (ns.h) */
     struct usock *s;
 } names[MAX_NAMES];
 
@@ -260,7 +262,8 @@ int usock_bind(struct file *f, const struct sockaddr_un *a, uint32_t len)
     if (s->bound || s->state != US_NEW) rc = -EINVAL;   /* another thread bound it meanwhile */
     for (int i = 0; i < MAX_NAMES && !rc; i++) {
         if (!names[i].used) { if (slot < 0) slot = i; continue; }
-        if (abstract && names[i].abstract && names[i].namelen == nl && !memcmp(names[i].name, name, nl)) rc = -EADDRINUSE;
+        if (abstract && names[i].abstract && names[i].net == netns_id(current_task()) && names[i].namelen == nl &&
+            !memcmp(names[i].name, name, nl)) rc = -EADDRINUSE;
     }
     if (!rc && slot < 0) rc = -ENOMEM;
     if (rc) { spin_unlock_irqrestore(&lock, fl); return rc; }   /* a path's node stays, as on Linux */
@@ -269,6 +272,7 @@ int usock_bind(struct file *f, const struct sockaddr_un *a, uint32_t len)
     names[slot].ino = ino;
     memcpy(names[slot].name, name, nl);
     names[slot].namelen = nl;
+    names[slot].net = abstract ? netns_id(current_task()) : 0;
     names[slot].s = s;
     memcpy(&s->addr, a, len);
     s->addrlen = len;
@@ -296,7 +300,9 @@ static struct usock *find_listener(bool abstract, const char *name, uint32_t nl,
 {
     for (int i = 0; i < MAX_NAMES; i++) {
         if (!names[i].used || names[i].abstract != abstract) continue;
-        if (abstract ? (names[i].namelen == nl && !memcmp(names[i].name, name, nl)) : names[i].ino == ino)
+        if (abstract ? (names[i].net == netns_id(current_task()) && names[i].namelen == nl &&
+                        !memcmp(names[i].name, name, nl))
+                     : names[i].ino == ino)
             return names[i].s;
     }
     return NULL;

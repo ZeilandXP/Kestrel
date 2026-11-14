@@ -24,6 +24,8 @@
 #include <kernel/sound.h>
 #include <kernel/linuxkpi.h>
 #include <kernel/pstate.h>
+#include <kernel/ns.h>
+#include <kernel/seccomp.h>
 
 #define P(...) (n += (size_t)snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__))
 
@@ -284,7 +286,14 @@ static size_t gen_loadavg(char *buf, size_t cap, void *ctx)
     static size_t fn(char *buf, size_t cap, void *ctx) { (void)ctx; size_t n = 0; P(__VA_ARGS__); return n; }
 SYSVAL(gen_sys_ostype, "%s\n", KESTREL_NAME)
 SYSVAL(gen_sys_osrelease, "%s\n", KESTREL_VERSION)
-SYSVAL(gen_sys_hostname, "%s\n", KESTREL_HOSTNAME)
+static size_t gen_sys_hostname(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx; size_t n = 0;
+    char host[65], domain[65];
+    uts_names(current_task(), host, domain);            /* the reader's UTS namespace */
+    P("%s\n", host);
+    return n;
+}
 SYSVAL(gen_sys_pid_max, "%d\n", 32768)
 SYSVAL(gen_sys_zero, "0\n")
 SYSVAL(gen_sys_map_count, "65530\n")
@@ -414,11 +423,14 @@ static size_t gen_pid_status(char *buf, size_t cap, void *ctx)
     uint64_t pages = c->rss;
     P("Name:\t%s\nState:\t%s\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n", t->name,
       t->state <= TASK_ZOMBIE ? names[t->state] : "?", t->tgid, t->pid, t->ppid);
-    P("Uid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\n", t->uid, t->uid, t->uid, t->uid,
-      t->gid, t->gid, t->gid, t->gid);
+    struct tcb *me = current_task();                    /* ids as the reader's namespace numbers them */
+    uint32_t u = uid_view(me, t->uid), g = gid_view(me, t->gid);
+    P("Uid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\n", u, u, u, u, g, g, g, g);
     if (t->user) P("VmSize:\t%lu kB\nVmRSS:\t%lu kB\n", pages * 4, pages * 4);
     P("Threads:\t%d\nSigPnd:\t%016lx\nShdPnd:\t%016lx\nSigBlk:\t%016lx\n", c->threads,
       t->sig_pending, c->shared_pending, t->sig_mask);
+    P("CapInh:\t%016lx\nCapPrm:\t%016lx\nCapEff:\t%016lx\nCapBnd:\t%016lx\nCapAmb:\t%016lx\n",
+      t->cap_inh, t->cap_prm, t->cap_eff, (uint64_t)CAP_FULL_SET, 0ul);
     P("NoNewPrivs:\t%d\nSeccomp:\t%d\n", t->no_new_privs, t->seccomp_mode);
     kfree(c);
     return n;
@@ -518,7 +530,157 @@ static int link_cwd(struct vnode *vn, char *buf, size_t size)
     memcpy(buf, tmp, n);
     return (int)n;
 }
-static int link_root(struct vnode *vn, char *buf, size_t size) { (void)vn; if (!size) return 0; buf[0] = '/'; return 1; }
+static int link_root(struct vnode *vn, char *buf, size_t size)
+{
+    uint64_t f = spin_lock_irqsave(&proc_lock);
+    struct fs_struct *fs = task_fs_get_locked(pid_task(vn->ctx));
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (!fs) return -ENOENT;
+    struct vnode *r = vfs_root_get(fs);                 /* chroot()'s, or NULL */
+    fs_put(fs);
+    char tmp[VFS_PATH_MAX] = "/";
+    int e = r ? vfs_path_of(r, tmp, sizeof tmp) : 0;
+    vfs_vnode_put(r);
+    if (e < 0) return e;
+    size_t n = strlen(tmp);
+    if (n > size) n = size;
+    memcpy(buf, tmp, n);
+    return (int)n;
+}
+
+/* ---- /proc/PID/ns: "net:[4026531840]" and friends. Following one gives a
+ * node with the namespace's number as its inode, so programs can compare
+ * two processes' namespaces with stat(); one node per namespace, dropped
+ * when the namespace goes (procfs_ns_gone). */
+static const char *const ns_kinds[] = { "cgroup", "ipc", "mnt", "net", "pid", "pid_for_children",
+                                        "time", "time_for_children", "user", "uts" };
+struct ns_link { void *ctx; const char *kind; };
+static struct { uint64_t ino; struct vnode *vn; } ns_nodes[256];
+static struct spinlock ns_nodes_lock;
+static struct mount *proc_mount;
+
+static int link_ns(struct vnode *vn, char *buf, size_t size)
+{
+    struct ns_link *l = vn->ctx;
+    char tmp[48];
+    uint64_t f = spin_lock_irqsave(&proc_lock);        /* its namespaces, while it lives */
+    struct tcb *t = pid_task(l->ctx);
+    int n = t ? ns_link_text(t, l->kind, tmp, sizeof tmp) : -ENOENT;
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (n < 0) return n;
+    if ((size_t)n > size) n = (int)size;
+    memcpy(buf, tmp, (size_t)n);
+    return n;
+}
+
+static struct vnode *link_ns_follow(struct vnode *vn)
+{
+    struct ns_link *l = vn->ctx;
+    char name[48];
+    uint64_t f = spin_lock_irqsave(&proc_lock);
+    struct tcb *t = pid_task(l->ctx);
+    uint64_t ino = t ? ns_ino(t, l->kind) : 0;
+    if (t) ns_link_text(t, l->kind, name, sizeof name);
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (!ino) return NULL;
+    struct vnode *fresh = NULL, *found = NULL;
+    for (int pass = 0; pass < 2 && !found; pass++) {
+        f = spin_lock_irqsave(&ns_nodes_lock);
+        int free_slot = -1;
+        for (int i = 0; i < 256 && !found; i++) {
+            if (ns_nodes[i].vn && ns_nodes[i].ino == ino) found = ns_nodes[i].vn;
+            else if (!ns_nodes[i].vn && free_slot < 0) free_slot = i;
+        }
+        if (!found && fresh && free_slot >= 0) {
+            ns_nodes[free_slot].ino = ino;
+            ns_nodes[free_slot].vn = found = fresh;
+            fresh = NULL;
+        }
+        spin_unlock_irqrestore(&ns_nodes_lock, f);
+        if (!found && !fresh) {                         /* made outside the lock, then put in */
+            fresh = vfs_node_floating(proc_mount, name, VREG, 0444);
+            if (!fresh) return NULL;
+            fresh->ino = ino;
+        }
+    }
+    if (fresh) vfs_vnode_put(fresh);                    /* lost a race, or the table is full */
+    return found;
+}
+
+void procfs_ns_gone(uint64_t ino)
+{
+    struct vnode *vn = NULL;
+    uint64_t f = spin_lock_irqsave(&ns_nodes_lock);
+    for (int i = 0; i < 256; i++)
+        if (ns_nodes[i].vn && ns_nodes[i].ino == ino) { vn = ns_nodes[i].vn; ns_nodes[i].vn = NULL; break; }
+    spin_unlock_irqrestore(&ns_nodes_lock, f);
+    vfs_vnode_put(vn);
+}
+
+static const struct vnode_ops ns_link_ops = { .readlink = link_ns, .follow = link_ns_follow, .nolock = true };
+
+static void proc_ns_dir(struct vnode *dir, void *ctx)
+{
+    struct vnode *d = vfs_node_new(dir->fs, "ns", VDIR, 0511, NULL);
+    if (!d) return;
+    vfs_node_add(dir, d);
+    for (size_t i = 0; i < sizeof ns_kinds / sizeof *ns_kinds; i++) {
+        struct ns_link *l = kzalloc(sizeof *l);
+        if (!l) return;
+        l->ctx = ctx;
+        l->kind = ns_kinds[i];
+        struct vnode *v = vfs_node_new(dir->fs, ns_kinds[i], VLNK, 0777, &ns_link_ops);
+        if (!v) { kfree(l); return; }
+        v->ctx = l;
+        vfs_node_add(d, v);
+    }
+}
+
+/* ---- /proc/PID/uid_map, gid_map, setgroups: written once (ns.h) ---- */
+struct map_file { void *ctx; int which; };
+
+static ssize_t map_read(struct vnode *vn, void *buf, size_t len, uint64_t off)
+{
+    struct map_file *m = vn->data;
+    char tmp[512];
+    uint64_t f = spin_lock_irqsave(&proc_lock);
+    struct tcb *t = pid_task(m->ctx);
+    int n = t ? ns_map_show(t, m->which, tmp, sizeof tmp) : 0;
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (off >= (uint64_t)n) return 0;
+    size_t r = (size_t)n - off < len ? (size_t)n - off : len;
+    memcpy(buf, tmp + off, r);
+    return (ssize_t)r;
+}
+
+static uint64_t map_size(struct vnode *vn) { char b[512]; return (uint64_t)map_read(vn, b, sizeof b, 0); }
+
+static ssize_t map_write(struct vnode *vn, const void *buf, size_t len, uint64_t off)
+{
+    struct map_file *m = vn->data;
+    if (off) return -EINVAL;                            /* one write, from the start, as on Linux */
+    if (len >= 4096) return -EINVAL;
+    uint64_t f = spin_lock_irqsave(&proc_lock);
+    struct tcb *t = pid_task(m->ctx);
+    spin_unlock_irqrestore(&proc_lock, f);
+    if (!t) return -ESRCH;
+    return ns_map_write(t, m->which, buf, len);
+}
+
+static const struct vnode_ops map_ops = { .read = map_read, .write = map_write, .size = map_size, .nolock = true,
+                                          .write_on_rdonly = true };
+
+static void proc_map_file(struct vnode *dir, const char *name, int which, void *ctx)
+{
+    struct map_file *m = kzalloc(sizeof *m);
+    if (!m) return;
+    m->ctx = ctx;
+    m->which = which;
+    struct vnode *v = vfs_node_new(dir->fs, name, VREG, 0644, &map_ops);
+    if (!v) { kfree(m); return; }
+    v->data = m;
+    vfs_node_add(dir, v);
+}
 static const struct vnode_ops exe_ops = { .readlink = link_exe, .nolock = true };
 static const struct vnode_ops cwd_ops = { .readlink = link_cwd, .nolock = true };
 static const struct vnode_ops root_ops = { .readlink = link_root, .nolock = true };
@@ -690,6 +852,11 @@ static void pid_files(struct vnode *dir, void *ctx)
     proc_link(dir, "cwd", &cwd_ops, ctx);
     proc_link(dir, "root", &root_ops, ctx);
     proc_fd_dir(dir, ctx);
+    pseudo_dir(dir, "fdinfo");                          /* (no entries yet; Firefox chroots into it) */
+    proc_ns_dir(dir, ctx);
+    proc_map_file(dir, "uid_map", 0, ctx);
+    proc_map_file(dir, "gid_map", 1, ctx);
+    proc_map_file(dir, "setgroups", 2, ctx);
     pseudo_file(dir, "stat", gen_pid_stat, ctx);
     pseudo_file(dir, "status", gen_pid_status, ctx);
     pseudo_file(dir, "cmdline", gen_pid_cmdline, ctx);
@@ -822,6 +989,7 @@ void procfs_init(const char *mountpoint)
     struct vnode *self = vfs_node_new(m, "self", VDIR, 0555, NULL);   /* the calling process */
     if (self) { vfs_node_add(r, self); pid_files(self, NULL); }
     proc_root = r;
+    proc_mount = m;
     r->ops = &proc_root_ops;
     vfs_mount(m, mountpoint);
 }

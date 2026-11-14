@@ -130,6 +130,10 @@ struct int_frame;
 #define SYS_pipe2         293
 #define SYS_prlimit64     302
 #define SYS_seccomp       317
+#define SYS_chroot        161
+#define SYS_sethostname   170
+#define SYS_setdomainname 171
+#define SYS_unshare       272
 #define SYS_getrandom     318
 #define SYS_pread64        17
 #define SYS_pwrite64       18

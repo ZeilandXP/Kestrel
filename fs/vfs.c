@@ -4,6 +4,7 @@
  *   pseudo  - read-only files whose content is generated on each read */
 #include <kernel/smp.h>
 #include <kernel/vfs.h>
+#include <kernel/ns.h>
 #include <kernel/inotify.h>
 #include <kernel/mm.h>
 #include <kernel/task.h>
@@ -202,6 +203,36 @@ static struct vnode *cwd_node(void)
     return (t && t->fs && t->fs->cwd) ? t->fs->cwd : root;
 }
 
+/* The calling task's root: chroot()'s, or the real one. Under the tree's lock. */
+static struct vnode *root_node(void)
+{
+    struct tcb *t = current_task();
+    return (t && t->fs && t->fs->root) ? t->fs->root : root;
+}
+
+struct vnode *vfs_root_get(struct fs_struct *fs)
+{
+    vfs_tree_lock(false);
+    struct vnode *vn = fs ? fs->root : NULL;
+    vfs_vnode_get(vn);
+    vfs_tree_unlock();
+    return vn;
+}
+
+/* chroot(): vn (a directory) becomes the calling task's "/". */
+void vfs_set_root(struct vnode *vn)
+{
+    struct tcb *t = current_task();
+    if (!t || !t->fs) return;
+    if (vn == root) vn = NULL;                          /* back to the real root */
+    vfs_vnode_get(vn);
+    vfs_tree_lock(true);
+    struct vnode *old = t->fs->root;
+    t->fs->root = vn;
+    vfs_tree_unlock();
+    vfs_vnode_put(old);
+}
+
 struct vnode *vfs_cwd_get(struct fs_struct *fs)
 {
     vfs_tree_lock(false);
@@ -297,7 +328,8 @@ static int walk(struct vnode *base, const char *path, int flags, struct vnode **
     if (!buf || !tmp) { r = -ENOMEM; goto out; }
     memcpy(buf, path, plen + 1);
     char *p = buf;
-    struct vnode *vn = path[0] == '/' ? root : (base ? base : cwd_node());
+    struct vnode *top = root_node();                    /* "/" and where ".." stops */
+    struct vnode *vn = path[0] == '/' ? top : (base ? base : cwd_node());
     int links = 0;
     for (;;) {
         while (*p == '/') p++;
@@ -324,6 +356,7 @@ static int walk(struct vnode *base, const char *path, int flags, struct vnode **
         }
         if (!strcmp(comp, ".")) { p = e; continue; }
         if (!strcmp(comp, "..")) {
+            if (vn == top) { p = e; continue; }        /* "/..": still "/" (also under chroot) */
             if (vn->unlinked) { r = -ENOENT; goto out; }    /* a removed directory has no parent */
             vn = vn->parent ? vn->parent : root;
             p = e;
@@ -349,7 +382,7 @@ static int walk(struct vnode *base, const char *path, int flags, struct vnode **
             memcpy(tmp + tl, e, rl + 1);                /* target + the rest of the path */
             char *sw = buf; buf = tmp; tmp = sw;
             p = buf;
-            if (*p == '/') vn = root;                   /* else: from the link's directory */
+            if (*p == '/') vn = top;                    /* else: from the link's directory */
             continue;
         }
         vn = c;
@@ -407,17 +440,20 @@ int vfs_lookup(const char *path, struct vnode **out) { return lookup_ref(NULL, p
 
 /* vn's absolute path, with the tree's lock held. A node out of the tree
  * (unlinked, or a memfd) is "/name (deleted)", as on Linux. */
-static int path_of(struct vnode *vn, char *buf, size_t size)
+static int path_from(struct vnode *vn, struct vnode *top, char *buf, size_t size)
 {
     if (vn && vn->unlinked) {
         int n = snprintf(buf, size, "/%s (deleted)", vn->name);
         return n < 0 || (size_t)n >= size ? -ERANGE : 0;
     }
     const char *parts[128]; int n = 0;
-    while (vn && vn != root && n < 128) { parts[n++] = vn->name; vn = vn->parent; }
+    while (vn && vn != top && vn != root && n < 128) { parts[n++] = vn->name; vn = vn->parent; }
     size_t pos = 0;
-    if (n == 0) { if (size < 2) return -ERANGE; strlcpy(buf, "/", size); return 0; }
-    buf[0] = 0;
+    /* outside a chroot: Linux's "(unreachable)" prefix */
+    const char *pre = top != root && vn != top ? "(unreachable)" : "";
+    if (n == 0) { if (size < 2 + strlen(pre)) return -ERANGE; snprintf(buf, size, "%s/", pre); return 0; }
+    strlcpy(buf, pre, size);
+    pos = strlen(buf);
     for (int i = n - 1; i >= 0; i--) {
         if (pos + 1 + strlen(parts[i]) + 1 > size) return -ERANGE;
         strlcat(buf, "/", size);
@@ -426,6 +462,8 @@ static int path_of(struct vnode *vn, char *buf, size_t size)
     }
     return 0;
 }
+
+static int path_of(struct vnode *vn, char *buf, size_t size) { return path_from(vn, root, buf, size); }
 
 int vfs_path_of(struct vnode *vn, char *buf, size_t size)
 {
@@ -809,8 +847,8 @@ void vfs_fill_stat(struct vnode *vn, struct stat *st)
     st->st_ino = vn->ino;
     st->st_nlink = vn->nlink ? vn->nlink : vn->type == VDIR ? 2 : 1;
     st->st_mode = vn->mode;
-    st->st_uid = vn->uid;
-    st->st_gid = vn->gid;
+    st->st_uid = uid_view(current_task(), vn->uid);     /* as the caller's user namespace numbers them */
+    st->st_gid = gid_view(current_task(), vn->gid);
     st->st_rdev = vn->rdev;
     st->st_size = (int64_t)node_size(vn);
     st->st_blksize = 4096;
@@ -847,7 +885,7 @@ int vfs_chdir(const char *path)
 int vfs_getcwd(char *buf, size_t size)
 {
     vfs_tree_lock(false);
-    int r = path_of(cwd_node(), buf, size);
+    int r = path_from(cwd_node(), root_node(), buf, size);
     vfs_tree_unlock();
     return r;
 }
@@ -965,11 +1003,11 @@ static int open_node(struct vnode *vn, int flags, bool created, struct file **ou
         *out = f;
         return 0;
     }
-    if (acc != O_RDONLY && (vn->fs->flags & MNT_RDONLY)) return -EROFS;
+    if (acc != O_RDONLY && (vn->fs->flags & MNT_RDONLY) && !(vn->ops && vn->ops->write_on_rdonly)) return -EROFS;
     /* POSIX: the creating open gets the access it asked for whatever the new
      * mode says; root (uid 0) is not limited by permission bits. */
     struct tcb *self = current_task();
-    if (acc != O_RDONLY && !(vn->mode & 0222) && !created && self && self->uid != 0) return -EACCES;
+    if (acc != O_RDONLY && !(vn->mode & 0222) && !created && self && !capable(CAP_DAC_OVERRIDE)) return -EACCES;
 
     bool trunc = (flags & O_TRUNC) && vn->type == VREG && acc != O_RDONLY && vn->ops && vn->ops->truncate;
     /* a device's open, or a truncation, by code that is not known to lock
@@ -1347,6 +1385,13 @@ static int ramfs_readlink(struct vnode *vn, char *buf, size_t size)
 }
 
 static const struct vnode_ops ramfs_link_ops = { .readlink = ramfs_readlink, .nolock = true };   /* fixed text */
+
+struct vnode *vfs_node_floating(struct mount *fs, const char *name, enum vtype t, uint32_t mode)
+{
+    struct vnode *vn = vfs_node_new(fs, name, t, mode, NULL);
+    if (vn) vn->refs = VN_GONE + 1;                     /* out of the tree; the caller's reference */
+    return vn;
+}
 
 /* An open file on a ramfs node that is in no directory (memfd_create):
  * freed with its last close. */

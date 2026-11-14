@@ -29,6 +29,7 @@
 #include <kernel/vm.h>
 #include <kernel/futex.h>
 #include <kernel/seccomp.h>
+#include <kernel/ns.h>
 #include <kernel/time.h>
 
 extern void user_return(struct int_frame *f) __attribute__((noreturn));
@@ -50,11 +51,12 @@ extern void user_return(struct int_frame *f) __attribute__((noreturn));
 #define CLONE_CHILD_SETTID   0x01000000
 #define CLONE_IO             0x80000000u
 #define CLONE_CLEAR_SIGHAND  0x100000000ull   /* clone3 only: caught signals start at SIG_DFL */
-/* Namespaces, pidfds, cgroups are not supported: they fail with EINVAL. */
+/* Namespaces: user, network, IPC and UTS (ns.h); PID, mount, cgroup and
+ * time namespaces, pidfds and cgroups fail with EINVAL. */
 #define CLONE_SUPPORTED      (0xff | CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_PTRACE | \
                               CLONE_VFORK | CLONE_PARENT | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | \
                               CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_DETACHED | CLONE_UNTRACED | \
-                              CLONE_CHILD_SETTID | CLONE_IO | CLONE_CLEAR_SIGHAND)
+                              CLONE_CHILD_SETTID | CLONE_IO | CLONE_CLEAR_SIGHAND | CLONE_NS_SUPPORTED)
 
 #define WNOHANG     1
 
@@ -236,7 +238,14 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if ((flags & CLONE_SETTLS) && tls && !uvm_range_ok(tls, 1)) return -EINVAL;
     if (newsp && !user_range_ok(newsp, 0)) return -EINVAL;
     bool thread = flags & CLONE_THREAD;
+    uint64_t nsflags = flags & CLONE_NS_SUPPORTED;      /* (0x80 is the exit signal's here, not CLONE_NEWTIME) */
+    if (nsflags && thread) return -EINVAL;              /* as Linux: a thread shares its process' */
+    if ((nsflags & CLONE_NEWUSER) && (flags & CLONE_FS)) return -EINVAL;
+    if ((nsflags & CLONE_NEWIPC) && (flags & CLONE_SYSVSEM)) return -EINVAL;
     if (p->signal->group_exit) return -EAGAIN;          /* the process is dying */
+    struct ns_set nss;
+    int nr = ns_prepare(p, nsflags, &nss);
+    if (nr) return nr;
 
     /* Everything that can fail, before the child exists. */
     struct mm *mm = NULL;
@@ -245,11 +254,11 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     struct sighand_struct *sh = NULL;
     struct int_frame *cf = NULL;
     if (flags & CLONE_VM) { mm = p->mm; mm_get(mm); }
-    else if (!(mm = mm_fork(p->mm))) return -ENOMEM;    /* copy-on-write */
+    else if (!(mm = mm_fork(p->mm))) { ns_abort(&nss); return -ENOMEM; }   /* copy-on-write */
     if (flags & CLONE_FILES) { files = p->files; __atomic_add_fetch(&files->refs, 1, __ATOMIC_ACQ_REL); }
     else files = files_dup(p->files);
     if (flags & CLONE_FS) { fs = p->fs; __atomic_add_fetch(&fs->refs, 1, __ATOMIC_ACQ_REL); }
-    else fs = fs_new(vfs_cwd_get(p->fs), p->fs->umask);
+    else fs = fs_copy(p->fs);                           /* cwd, root and umask */
     if (flags & CLONE_SIGHAND) { sh = p->sighand; __atomic_add_fetch(&sh->refs, 1, __ATOMIC_ACQ_REL); }
     else if ((sh = sighand_new(NULL))) {
         uint64_t fl = spin_lock_irqsave(&proc_lock);    /* another thread's sigaction() */
@@ -296,6 +305,8 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     c->sid = p->sid;
     c->sig_mask = p->sig_mask;
     seccomp_fork(c, p);                                 /* under the lock a TSYNC holds */
+    c->cap_eff = p->cap_eff; c->cap_prm = p->cap_prm; c->cap_inh = p->cap_inh;
+    ns_install(c, &nss);                                /* a new user namespace: all capabilities in it */
     c->sig_pending = 0;
     /* exit_group() or execve() in another thread already sent its SIGKILLs:
      * this one gets its own (taken on its first way back to the kernel) */
@@ -335,6 +346,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     return pid;
 
 nomem:
+    ns_abort(&nss);
     kfree(cf);
     files_put(files);
     fs_put(fs);
@@ -342,6 +354,7 @@ nomem:
     mm_put(mm);
     return -ENOMEM;
 again:
+    ns_abort(&nss);
     files_put(files);
     fs_put(fs);
     sighand_put(sh);
@@ -513,6 +526,7 @@ int64_t proc_execve_path(char *path, uint64_t uargv, uint64_t uenvp)
     t->saved_mask_valid = false;
     t->robust_list = 0;
     t->alt_sp = t->alt_size = 0;
+    caps_exec(t);                                       /* root (in its user namespace) gets them all */
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
     fl = spin_lock_irqsave(&proc_lock);                /* /proc/PID/exe and comm */
     strlcpy(t->exe, abs ? abs : path, sizeof t->exe);
@@ -1336,7 +1350,7 @@ void sig_temp_mask_end(void)
 static int64_t init_signal(int sig, struct tcb *self)
 {
     if (sig == 0) return 0;
-    if (self->uid != 0) return -EPERM;
+    if (!capable(CAP_SYS_BOOT)) return -EPERM;
     switch (sig) {
     case SIGTERM: power_reboot();
     case SIGUSR2: power_off();

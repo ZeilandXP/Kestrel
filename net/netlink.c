@@ -20,6 +20,7 @@
  * groups RTNLGRP_LINK, _IPV4_IFADDR and _IPV4_ROUTE. A change of address
  * made from user space stops the kernel's DHCP client on that link. */
 #include "msock.h"
+#include <kernel/ns.h>
 #include <kernel/socket.h>
 #include <kernel/task.h>
 #include <kernel/string.h>
@@ -427,6 +428,7 @@ static int dump(struct nlout *o, const struct nlmsghdr *h, const uint8_t *body, 
     uint8_t family = blen ? body[0] : AF_UNSPEC;        /* every request starts with the family */
     bool v4 = family == AF_UNSPEC || family == AF_INET;
     struct nlm m;
+    if (!netns_initial(current_task())) { done(o, h); return DUMPED; }   /* a network namespace of its own: nothing to list */
     switch (h->type) {
     case RTM_GETLINK:
         for (struct netif *n = netif_list(); n; n = n->next) { fill_link(&m, n, RTM_NEWLINK, NLM_F_MULTI, h->seq, h->pid); out_put(o, &m); }
@@ -474,7 +476,7 @@ static int request(struct nlout *o, const struct nlmsghdr *h)
     size_t blen = h->len - NLMSG_HDRLEN;
     bool get = (h->type & 3) == 2;                      /* RTM_GET* are 18, 22, 26, ... */
     if (get && (h->flags & NLM_F_DUMP) == NLM_F_DUMP) return dump(o, h, body, blen);
-    if (!get && current_task()->uid != 0) return -EPERM;
+    if (!get && !capable(CAP_NET_ADMIN)) return -EPERM;
     struct attrs at;
     struct nlm m;
     switch (h->type) {
@@ -573,7 +575,7 @@ long netlink_send(struct msock *s, const uint8_t *buf, size_t len, const struct 
             }
         return -ECONNREFUSED;
     }
-    if (to->nl_groups) return current_task()->uid ? -EPERM : (long)len;   /* user multicast: nobody needs it */
+    if (to->nl_groups) return !capable(CAP_NET_ADMIN) ? -EPERM : (long)len;   /* user multicast: nobody needs it */
     struct nlout *o = kmalloc(sizeof *o);
     if (!o) return -ENOMEM;
     o->to = s;

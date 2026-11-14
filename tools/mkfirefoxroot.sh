@@ -34,8 +34,8 @@
 # - bash as root's login shell, and halt, reboot, poweroff and shutdown
 #   that work without systemd;
 # - /usr/local/bin/firefox, which starts PulseAudio if it is not running
-#   and Firefox with the sandbox off (Kestrel has no seccomp or namespaces
-#   yet), and an IceWM menu for root;
+#   and Firefox with its sandboxes on (KESTREL_FIREFOX_SANDBOX=0 turns
+#   them off), and an IceWM menu for root;
 # - the LXDE desktop, which /bin/startx runs when it finds startlxde:
 #   Openbox, LXPanel, LXSession, the PCManFM file manager (and desktop),
 #   Xarchiver, LXRandR (monitor settings, through xrandr), LXTerminal,
@@ -211,11 +211,16 @@ EOF
 mkdir -p "$ROOT/usr/local/bin"
 cat > "$ROOT/usr/local/bin/firefox" <<'EOF'
 #!/bin/sh
-# Firefox on Kestrel: its sandboxes need seccomp-bpf and namespaces, which
-# Kestrel does not have yet, so they are off.
-export MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 MOZ_DISABLE_RDD_SANDBOX=1 \
-       MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 MOZ_DISABLE_UTILITY_SANDBOX=1 MOZ_DISABLE_GPU_SANDBOX=1 \
-       MOZ_CRASHREPORTER_DISABLE=1
+# Firefox on Kestrel, with its sandboxes on: seccomp-bpf filters, and user,
+# network and IPC namespaces with a chroot for content processes.
+# MOZ_ASSUME_USER_NS=1 skips Firefox's probe for user namespaces, which
+# also tries a PID namespace (Kestrel has none; Firefox doesn't use one).
+# KESTREL_FIREFOX_SANDBOX=0 turns the sandboxes off, as in 0.3.8.
+export MOZ_ASSUME_USER_NS=1 MOZ_CRASHREPORTER_DISABLE=1
+if [ "${KESTREL_FIREFOX_SANDBOX:-1}" = 0 ]; then
+    export MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 MOZ_DISABLE_RDD_SANDBOX=1 \
+           MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 MOZ_DISABLE_UTILITY_SANDBOX=1 MOZ_DISABLE_GPU_SANDBOX=1
+fi
 export DISPLAY=${DISPLAY:-:0}
 [ "$HOME" = / ] && [ "$(id -u)" = 0 ] && export HOME=/root     # kestrel.exec programs start with HOME=/
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/runtime-$(id -u)}
