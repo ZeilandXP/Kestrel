@@ -28,7 +28,9 @@
  *   kestrel-install               the steps, full screen
  *   kestrel-install --list        the disks and what each offers
  *   kestrel-install --auto FILE   no questions: the answers in FILE
- *                                 (key=value lines; see auto_load()) */
+ *                                 (key=value lines; see auto_run())
+ *   kestrel-install --update [DISK]  an installed Kestrel to this release
+ *                                 (update.c; also as kestrel-update) */
 #define _GNU_SOURCE
 #include "install.h"
 #include <stdio.h>
@@ -44,20 +46,21 @@
 #include <sys/reboot.h>
 
 #define VERSION_FILE    "/proc/sys/kernel/osrelease"
-#define IMAGES          "/boot/share/kestrel/boot"
-#define TARGET          "/mnt/kestrel-target"
-#define LOG             "/var/log/kestrel-install.log"
 
-static char version[32] = "?";
+char version[32] = "?";
 static struct disk disks[MAX_DISKS];
 static int ndisks;
 static struct settings S = { .autologin = true };
 static struct plan P;
-static uint64_t boot_vol_bytes, root_need;      /* what the system needs on the disk */
-static char boot_src[32];                       /* the running boot volume's device */
-static uint64_t boot_src_block;
-static const char *root_src = "/";
-static bool auto_mode, ui_on;
+uint64_t boot_vol_bytes;
+static uint64_t root_need;      /* what the system needs on the disk */
+char boot_src[32];                       /* the running boot volume's device */
+uint64_t boot_src_block;
+const char *root_src = "/";
+static bool auto_mode;
+bool ui_on;
+static struct installed inst[8];                /* installed systems: updates */
+static int ninst;
 static char kind_choice = 'e';                  /* e(rase) a(longside) s(omething else) */
 
 static const char *const steps[] = { "Welcome", "Keyboard", "Installation type", "Disk", "Time zone", "Who are you", "Install" };
@@ -66,7 +69,7 @@ enum { ST_WELCOME, ST_KEYBOARD, ST_TYPE, ST_DISK, ST_TZ, ST_USER, ST_INSTALL, ST
 /* ---- what is there to install ------------------------------------------------ */
 static void trim(char *s) { size_t n = strlen(s); while (n && (s[n - 1] == '\n' || s[n - 1] == ' ')) s[--n] = 0; }
 
-static int sources(char *err, size_t cap)
+int sources(char *err, size_t cap)
 {
     char *v = read_file(VERSION_FILE, NULL);
     if (v) { snprintf(version, sizeof version, "%s", v); trim(version); free(v); }
@@ -100,8 +103,8 @@ static int sources(char *err, size_t cap)
 }
 
 static const char *const base_skip[] = { "/proc", "/sys", "/dev", "/run", "/tmp", "/boot", "/mnt", "/media",
-                                          "/lost+found", "/var/tmp", NULL };
-static const char **skip_list(void)
+                                          "/lost+found", "/var/tmp", "/var/lib/kestrel", NULL };
+const char **skip_list(void)
 {
     static const char *list[64];
     int n = 0;
@@ -158,16 +161,28 @@ static void disk_line(const struct disk *d, char *out, size_t cap)
 static int step_welcome(void)
 {
     char text[1024];
-    snprintf(text, sizeof text,
+    int n = snprintf(text, sizeof text,
              "This puts Kestrel %s on a disk of this computer, so that it starts without the stick.\n\n"
              "This installer is a beta: back up anything you care about first. Nothing is written to any "
              "disk until the last step, where you see every change and confirm it.", version);
-    struct menu_item it[] = {
-        { "Install Kestrel", "Choose a keyboard, a disk, a time zone and your account, then install", false },
-        { "Try Kestrel", "Leave the installer and keep using Kestrel from the stick", false },
-    };
-    int c = ui_menu("Welcome", text, it, 2, 0);
-    return c == 0 ? 1 : -2;                     /* -2: quit */
+    if (ninst) snprintf(text + n, sizeof text - (size_t)n, "\n\nKestrel is installed on this computer already. Updating it keeps "
+                        "your files, accounts and settings.");
+    struct menu_item it[10];
+    static char lab[8][96], det[8][128];
+    int k = 0;
+    for (int i = 0; i < ninst; i++) {
+        int c = version_cmp(version, inst[i].version);
+        if (c > 0) snprintf(lab[i], sizeof lab[i], "Update Kestrel %s on %s to %s", inst[i].version, inst[i].disk->name, version);
+        else snprintf(lab[i], sizeof lab[i], "%s Kestrel %s on %s", c ? "Update" : "Reinstall", inst[i].version, inst[i].disk->name);
+        snprintf(det[i], sizeof det[i], c < 0 ? "Kestrel %s is newer than this %s" : "Keeps your files, accounts and settings (%s, %s)",
+                 c < 0 ? inst[i].version : inst[i].disk->model[0] ? inst[i].disk->model : inst[i].disk->kind, version);
+        it[k++] = (struct menu_item){ lab[i], det[i], c < 0 };
+    }
+    it[k++] = (struct menu_item){ "Install Kestrel", "Choose a keyboard, a disk, a time zone and your account, then install", false };
+    it[k++] = (struct menu_item){ "Try Kestrel", "Leave the installer and keep using Kestrel from the stick", false };
+    int c = ui_menu("Welcome", text, it, k, 0);
+    if (c >= 0 && c < ninst) return step_update(&inst[c]) ? -2 : 0;
+    return c == ninst ? 1 : -2;                 /* -2: quit */
 }
 
 static void apply_layout(int l)
@@ -449,17 +464,18 @@ static int step_user(void)
 }
 
 /* ---- installing -------------------------------------------------------------- */
+const char *progress_heading = "Installing Kestrel";
 static const char *phase;
 static double phase_lo, phase_hi;
-static void progress(double f, const char *detail)
+void progress(double f, const char *detail)
 {
     double all = phase_lo + (phase_hi - phase_lo) * f;
-    if (ui_on) ui_progress("Installing Kestrel", phase, all, detail);
+    if (ui_on) ui_progress(progress_heading, phase, all, detail);
     else { static int last = -1; int pct = (int)(all * 100); if (pct != last) { printf("[%3d%%] %s%s%s\n", pct, phase, detail ? ": " : "", detail ? detail : ""); fflush(stdout); last = pct; } }
 }
-static void begin(const char *what, double lo, double hi) { phase = what; phase_lo = lo; phase_hi = hi; ilog("== %s", what); progress(0, NULL); }
+void begin(const char *what, double lo, double hi) { phase = what; phase_lo = lo; phase_hi = hi; ilog("== %s", what); progress(0, NULL); }
 
-static void copy_progress(const struct copy_progress *p, void *ctx)
+void copy_progress(const struct copy_progress *p, void *ctx)
 {
     (void)ctx;
     char d[256];
@@ -468,16 +484,7 @@ static void copy_progress(const struct copy_progress *p, void *ctx)
     progress(p->total ? (double)p->bytes / (double)p->total : 0, d);
 }
 
-static uint32_t crc32z(uint32_t crc, const uint8_t *b, size_t n)
-{
-    static uint32_t t[256];
-    if (!t[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1; t[i] = c; }
-    crc = ~crc;
-    while (n--) crc = t[(crc ^ *b++) & 0xFF] ^ (crc >> 8);
-    return ~crc;
-}
-
-static void uuid_str(const uint8_t u[16], char *out)
+void uuid_str(const uint8_t u[16], char *out)
 {
     sprintf(out, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
@@ -488,9 +495,12 @@ static void *slurp(const char *path, size_t *n)
     return read_file(path, n);
 }
 
-/* The boot volume: copied from its device into the first slot, with a new
- * UUID (so that the stick's and this one are told apart). */
-static int install_bootvol(const char *dev, uint8_t uuid[16], char *err, size_t cap)
+/* The boot volume: copied from its device into a slot of the partition
+ * (0, its start: the installer; 1, its middle: an update after slot 0),
+ * with a new UUID (so that the stick's and this one are told apart). The
+ * header goes last, so that the slot holds a volume only once it is whole;
+ * for slot 0 the second slot's header is cleared first: no stale volume. */
+int copy_bootvol(const char *dev, int slot, uint8_t uuid[16], char *err, size_t cap)
 {
     int in = dev_open(boot_src, O_RDONLY), outfd = dev_open(dev, O_RDWR);
     if (in < 0 || outfd < 0) { snprintf(err, cap, "opening the boot volume devices: %s", strerror(errno)); if (in >= 0) close(in); if (outfd >= 0) close(outfd); return -1; }
@@ -509,20 +519,22 @@ static int install_bootvol(const char *dev, uint8_t uuid[16], char *err, size_t 
     uint32_t c = crc32z(0, hdr, 512);
     memcpy(hdr + 16, &c, 4);
     uint64_t total = poff + plen;
+    uint64_t psize = (uint64_t)lseek(outfd, 0, SEEK_END);
+    uint64_t half = psize / 2 / 512 * 512;
+    uint64_t dst = slot ? half : 0, room = slot ? psize - half : psize >= 2 * 2048 * 512 ? half : psize;
+    if (total > room) { snprintf(err, cap, "the boot volume (%llu MB) does not fit in its slot (%llu MB)", (unsigned long long)(total / 1000000), (unsigned long long)(room / 1000000)); close(in); close(outfd); return -1; }
     char *buf = malloc(MIB);
     if (!buf) { close(in); close(outfd); snprintf(err, cap, "out of memory"); return -1; }
-    /* the second slot's header goes first: no stale volume there */
     static uint8_t zero[512];
-    struct stat st;
-    uint64_t psize = 0;
-    if (fstat(outfd, &st) == 0) psize = (uint64_t)lseek(outfd, 0, SEEK_END);
-    if (psize >= 2 * 2048 * 512) r = dev_pwrite(outfd, zero, 512, psize / 2 / 512 * 512);
+    if (slot) r = dev_pwrite(outfd, zero, 512, dst);            /* this slot's old header: gone first */
+    else if (psize >= 2 * 2048 * 512) r = dev_pwrite(outfd, zero, 512, half);
     for (uint64_t o = 512; r == 0 && o < total; o += MIB) {
         size_t n = total - o < MIB ? (size_t)(total - o) : MIB;
-        if ((r = dev_pread(in, buf, n, base + o)) == 0) r = dev_pwrite(outfd, buf, n, o);
+        if ((r = dev_pread(in, buf, n, base + o)) == 0) r = dev_pwrite(outfd, buf, n, dst + o);
         progress((double)o / (double)total, NULL);
     }
-    if (r == 0) r = dev_pwrite(outfd, hdr, 512, 0);       /* the header last: valid only when complete */
+    if (r == 0 && fsync(outfd) < 0) r = -errno;
+    if (r == 0) r = dev_pwrite(outfd, hdr, 512, dst);    /* the header last: valid only when complete */
     if (r == 0 && fsync(outfd) < 0) r = -errno;
     free(buf);
     close(in);
@@ -530,7 +542,32 @@ static int install_bootvol(const char *dev, uint8_t uuid[16], char *err, size_t 
     if (r < 0) { snprintf(err, cap, "copying the boot volume: %s", strerror(-r)); return -1; }
     char u[40];
     uuid_str(uuid, u);
-    ilog("boot volume copied to %s: %llu bytes, uuid %s", dev, (unsigned long long)total, u);
+    ilog("boot volume copied to %s slot %c: %llu bytes, uuid %s", dev, 'a' + slot, (unsigned long long)total, u);
+    return 0;
+}
+
+/* GRUB's local.cfg: one sector, so that rewriting it switches at once. */
+int esp_cfg(char cfg[512], const struct boot_cfg *b)
+{
+    int n = snprintf(cfg, 512,
+             "# Kestrel %s: this system's boot settings for GRUB (kestrel-install)\n"
+             "set kestrel_installed=1\n"
+             "set kestrel_root=any\n"
+             "set kestrel_slot=%c\n"
+             "set kestrel_kernel=/boot/kernel-%c.elf\n"
+             "set kestrel_cmdline=\"kestrel.uuid=%s kestrel.keymap=%s\"\n"
+             "set kestrel_desktop=\"kestrel.exec=/bin/startx\"\n",
+             b->version, b->slot, b->slot, b->uuid, b->keymap);
+    if (b->prev_slot && n < 512)
+        n += snprintf(cfg + n, 512 - (size_t)n,
+                      "set kestrel_prev_version=%s\n"
+                      "set kestrel_prev_kernel=/boot/kernel-%c.elf\n"
+                      "set kestrel_prev_cmdline=\"kestrel.uuid=%s kestrel.keymap=%s\"\n",
+                      b->prev_version, b->prev_slot, b->prev_uuid, b->keymap);
+    if (n < 512) n += snprintf(cfg + n, 512 - (size_t)n, "set timeout=%d\n", b->timeout);
+    if (n >= 511) return -1;
+    for (; n < 511; n++) cfg[n] = n % 64 == 63 ? '\n' : '#';   /* 512 bytes: one sector, rewritten at once */
+    cfg[511] = '\n';
     return 0;
 }
 
@@ -540,27 +577,17 @@ static int install_esp(const char *dev, const uint8_t uuid[16], char *err, size_
     void *kernel = slurp(IMAGES "/kernel.elf", &kn);
     void *efi = slurp(IMAGES "/bootx64.efi", &en);
     if (!kernel) { snprintf(err, cap, "cannot read %s", IMAGES "/kernel.elf"); free(efi); return -1; }
-    char u[40], cfg[1024];
-    uuid_str(uuid, u);
-    const struct layout *l = &layouts[S.layout];
-    int n = snprintf(cfg, sizeof cfg,
-             "# Kestrel %s: this system's boot settings, read by GRUB (written by\n"
-             "# kestrel-install; kestrel-update writes it again for each release)\n"
-             "set kestrel_installed=1\n"
-             "set kestrel_root=any\n"
-             "set kestrel_slot=a\n"
-             "set kestrel_kernel=/boot/kernel-a.elf\n"
-             "set kestrel_cmdline=\"kestrel.uuid=%s kestrel.keymap=%s\"\n"
-             "set kestrel_desktop=\"%s\"\n"
-             "set timeout=%d\n",
-             version, u, l->kernel, "kestrel.exec=/bin/startx",
-             P.erase ? 3 : 10);
-    for (; n < 511; n++) cfg[n] = n % 64 == 63 ? '\n' : '#';   /* 512 bytes: one sector, rewritten at once */
-    cfg[511] = '\n';
-    struct fat_file f[3];
+    struct boot_cfg bc = { .slot = 'a', .timeout = P.erase ? 3 : 10 };
+    snprintf(bc.keymap, sizeof bc.keymap, "%s", layouts[S.layout].kernel);
+    snprintf(bc.version, sizeof bc.version, "%s", version);
+    uuid_str(uuid, bc.uuid);
+    char cfg[512];
+    if (esp_cfg(cfg, &bc) < 0) { snprintf(err, cap, "local.cfg is too long"); free(kernel); free(efi); return -1; }
+    struct fat_file f[4];
     int nf = 0;
     if (efi) f[nf++] = (struct fat_file){ "EFI/BOOT/BOOTX64.EFI", efi, en };
     f[nf++] = (struct fat_file){ "boot/kernel-a.elf", kernel, kn };
+    f[nf++] = (struct fat_file){ "boot/kernel-b.elf", kernel, kn };       /* the updater's second slot */
     f[nf++] = (struct fat_file){ "boot/grub/local.cfg", cfg, 512 };
     int fd = dev_open(dev, O_RDWR);
     if (fd < 0) { snprintf(err, cap, "opening /dev/%s: %s", dev, strerror(errno)); free(kernel); free(efi); return -1; }
@@ -576,35 +603,47 @@ static int install_esp(const char *dev, const uint8_t uuid[16], char *err, size_
     return r;
 }
 
-static int install_grub(uint64_t boot_start, char *err, size_t cap)
+/* GRUB: boot.img into the MBR's code (the table stays, with the sector-0
+ * pointer to the boot volume), core.img into the sectors before the first
+ * partition. Nothing is written when both are there already. */
+int write_grub(const char *disk, uint64_t first, uint64_t boot_start, char *err, size_t cap)
 {
     size_t bn = 0, cn = 0;
     uint8_t *boot = slurp(IMAGES "/boot.img", &bn), *core = slurp(IMAGES "/core.img", &cn);
     if (!boot || !core || bn < 440) { free(boot); free(core); snprintf(err, cap, "cannot read GRUB's images"); return -1; }
-    uint64_t first = ~0ull;
-    for (int i = 0; i < P.disk->nparts; i++) if (P.disk->part[i].start < first) first = P.disk->part[i].start;
-    for (int i = 0; i < P.nnp; i++) if (P.np[i].start < first) first = P.np[i].start;
-    if (P.erase) first = P.np[0].start;
     uint64_t room = (first - 1) * SECTOR;
     if (cn > room) { free(boot); free(core); snprintf(err, cap, "GRUB (%zu bytes) does not fit before the first partition", cn); return -1; }
-    int fd = dev_open(P.disk->name, O_RDWR);
-    if (fd < 0) { free(boot); free(core); snprintf(err, cap, "opening /dev/%s: %s", P.disk->name, strerror(errno)); return -1; }
-    uint8_t s0[512];
+    int fd = dev_open(disk, O_RDWR);
+    if (fd < 0) { free(boot); free(core); snprintf(err, cap, "opening /dev/%s: %s", disk, strerror(errno)); return -1; }
+    uint8_t s0[512], n0[512];
+    uint8_t *old = malloc(cn);
     int r = dev_pread(fd, s0, 512, 0);
-    if (r == 0) r = dev_pwrite(fd, core, cn, SECTOR);
     if (r == 0) {
-        memcpy(s0, boot, 440);
-        memcpy(s0 + 3, "KESTREL_BOOT", 12);             /* option B: where the boot volume starts */
-        memcpy(s0 + 15, &boot_start, 8);
-        r = dev_pwrite(fd, s0, 512, 0);
+        memcpy(n0, s0, 512);
+        memcpy(n0, boot, 440);
+        memcpy(n0 + 3, "KESTREL_BOOT", 12);             /* option B: where the boot volume starts */
+        memcpy(n0 + 15, &boot_start, 8);
     }
+    bool same = r == 0 && old && !memcmp(s0, n0, 512) && dev_pread(fd, old, cn, SECTOR) == 0 && !memcmp(old, core, cn);
+    free(old);
+    if (r == 0 && !same) r = dev_pwrite(fd, core, cn, SECTOR);
+    if (r == 0 && !same) r = dev_pwrite(fd, n0, 512, 0);
     if (r == 0 && fsync(fd) < 0) r = -errno;
     close(fd);
     free(boot);
     free(core);
-    if (r < 0) { snprintf(err, cap, "writing GRUB to /dev/%s: %s", P.disk->name, strerror(-r)); return -1; }
-    ilog("GRUB written to %s: core.img %zu bytes", P.disk->name, cn);
+    if (r < 0) { snprintf(err, cap, "writing GRUB to /dev/%s: %s", disk, strerror(-r)); return -1; }
+    ilog(same ? "GRUB on %s is current: core.img %zu bytes" : "GRUB written to %s: core.img %zu bytes", disk, cn);
     return 0;
+}
+
+static int install_grub(uint64_t boot_start, char *err, size_t cap)
+{
+    uint64_t first = ~0ull;
+    for (int i = 0; i < P.disk->nparts; i++) if (P.disk->part[i].start < first) first = P.disk->part[i].start;
+    for (int i = 0; i < P.nnp; i++) if (P.np[i].start < first) first = P.np[i].start;
+    if (P.erase) first = P.np[0].start;
+    return write_grub(P.disk->name, first, boot_start, err, cap);
 }
 
 static int do_install(char *err, size_t cap)
@@ -642,7 +681,11 @@ static int do_install(char *err, size_t cap)
 
     /* 3. the files */
     begin("Copying files", 0.08, 0.85);
-    int r = copy_tree(root_src, TARGET, skip_list(), copy_progress, NULL, err, cap);
+    FILE *mf = fopen(MANIFEST_TMP, "w");
+    struct copy_opts co = { .skip = skip_list(), .cb = copy_progress, .manifest = mf };
+    int r = copy_tree_opts(root_src, TARGET, &co, err, cap);
+    if (mf && fclose(mf) != 0) ilog("writing %s: %s", MANIFEST_TMP, strerror(errno));
+    if (r == 0) save_manifest(TARGET);
     if (r == 0) {
         static const char *const dirs[] = { "boot", "dev", "etc", "home", "mnt", "proc", "root", "run", "sys", "tmp",
                                             "usr", "var", "var/log", "var/tmp", NULL };
@@ -675,7 +718,7 @@ static int do_install(char *err, size_t cap)
     /* 4. the boot volume, the EFI partition, GRUB */
     uint8_t uuid[16];
     begin("Installing the boot volume", 0.88, 0.95);
-    if (install_bootvol(bootv, uuid, err, cap) < 0) return -1;
+    if (copy_bootvol(bootv, 0, uuid, err, cap) < 0) return -1;
     begin("Installing the boot loader", 0.95, 1.0);
     if (install_esp(esp, uuid, err, cap) < 0) return -1;
     if (install_grub(P.np[1].start, err, cap) < 0) return -1;
@@ -809,6 +852,9 @@ static void list_disks(void)
             printf("  free %d: %s at %llu%s: %s\n", f, sz, (unsigned long long)d->free[f].start,
                    d->free[f].in_extended ? " (in the extended partition)" : "", ok ? (p.logical ? "fits (logical partitions)" : "fits") : p.why_not);
         }
+        for (int k = 0; k < ninst; k++)
+            if (inst[k].disk == d) printf("  installed: Kestrel %s (%s, %s, %s; slot %c)\n", inst[k].version, inst[k].esp->dev,
+                                          inst[k].bootv->dev, inst[k].root->dev, inst[k].cfg.slot);
         struct plan e = { .disk = d, .erase = true };
         printf("  erase: %s\n\n", plan_layout(&e, boot_part_sectors()) ? "possible" : e.why_not);
     }
@@ -823,9 +869,14 @@ int main(int argc, char **argv)
     if (sources(err, sizeof err) < 0) { fprintf(stderr, "kestrel-install: %s\n", err); return 1; }
     ndisks = disk_scan(disks, MAX_DISKS);
     sizes();
+    ninst = find_installed(disks, ndisks, inst, 8);
+    const char *me = strrchr(argv[0], '/');
+    me = me ? me + 1 : argv[0];
+    if (!strcmp(me, "kestrel-update")) return update_main(disks, ndisks, argc - 1, argv + 1);
+    if (argc > 1 && !strcmp(argv[1], "--update")) return update_main(disks, ndisks, argc - 2, argv + 2);
     if (argc > 1 && !strcmp(argv[1], "--list")) { list_disks(); return 0; }
     if (argc > 2 && !strcmp(argv[1], "--auto")) { auto_mode = true; return auto_run(argv[2]); }
-    if (argc > 1) { fprintf(stderr, "usage: kestrel-install [--list | --auto FILE]\n"); return 2; }
+    if (argc > 1) { fprintf(stderr, "usage: kestrel-install [--list | --auto FILE | --update [DISK [--force]]]\n"); return 2; }
     char *km = read_file("/proc/sys/kernel/keymap", NULL);
     if (km) { trim(km); for (int i = 0; i < layout_count; i++) if (!strcmp(layouts[i].kernel, km)) S.layout = i; free(km); }
 

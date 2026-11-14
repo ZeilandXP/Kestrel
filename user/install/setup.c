@@ -117,7 +117,7 @@ char *read_file(const char *path, size_t *len)
 int write_file(const char *path, const char *text, mode_t mode)
 {
     char tmp[512];
-    snprintf(tmp, sizeof tmp, "%s.kestrel-new", path);
+    snprintf(tmp, sizeof tmp, "%s.kestrel-tmp", path);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
     if (fd < 0) return -errno;
     size_t n = strlen(text);

@@ -326,8 +326,13 @@ static int discover(void)
         uint32_t left = now < deadline ? (uint32_t)(deadline - now) : 0;
         usb_storage_scan(left < 2000 ? (left > 500 ? left : 500) : 2000);
 
-        for (int i = 0; i < blk_count() && i < BLK_MAX; i++) {
+        /* A RAM disk first: the volume GRUB loaded as a module (the ISO),
+         * so that a Kestrel installed on a disk of the PC does not win. */
+        int cnt = blk_count() < BLK_MAX ? blk_count() : BLK_MAX;
+        for (int n = 0; n < 2 * cnt; n++) {
+            int i = n % cnt;
             struct blkdev *b = blk_get(i);
+            if ((b->kind == BLK_DISK_RAM) != (n < cnt)) continue;
             if (examined[i] || !wanted(b)) continue;
             examined[i] = true;
             int rc = try_disk(b);
