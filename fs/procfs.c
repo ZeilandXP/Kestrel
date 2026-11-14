@@ -26,6 +26,7 @@
 #include <kernel/pstate.h>
 #include <kernel/ns.h>
 #include <kernel/seccomp.h>
+#include <kernel/keymap.h>
 
 #define P(...) (n += (size_t)snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__))
 
@@ -686,6 +687,33 @@ static void proc_map_file(struct vnode *dir, const char *name, int which, void *
     v->data = m;
     vfs_node_add(dir, v);
 }
+/* ---- /proc/sys/kernel/keymap: the text terminals' layout; keymaps lists them */
+static ssize_t keymap_read(struct vnode *vn, void *buf, size_t len, uint64_t off)
+{
+    (void)vn;
+    char tmp[16];
+    int n = snprintf(tmp, sizeof tmp, "%s\n", keymap_name());
+    if (off >= (uint64_t)n) return 0;
+    size_t r = (size_t)n - off < len ? (size_t)n - off : len;
+    memcpy(buf, tmp + off, r);
+    return (ssize_t)r;
+}
+static uint64_t keymap_size(struct vnode *vn) { char b[16]; return (uint64_t)keymap_read(vn, b, sizeof b, 0); }
+static ssize_t keymap_write(struct vnode *vn, const void *buf, size_t len, uint64_t off)
+{
+    (void)vn; (void)off;
+    if (!capable(CAP_SYS_ADMIN)) return -EPERM;
+    char name[16];
+    size_t n = len < sizeof name - 1 ? len : sizeof name - 1;
+    memcpy(name, buf, n);
+    while (n && (name[n - 1] == '\n' || name[n - 1] == ' ')) n--;
+    name[n] = 0;
+    return keymap_set(name) < 0 ? -EINVAL : (ssize_t)len;
+}
+static const struct vnode_ops keymap_ops = { .read = keymap_read, .write = keymap_write, .size = keymap_size,
+                                             .nolock = true, .write_on_rdonly = true };
+static size_t gen_sys_keymaps(char *buf, size_t cap, void *ctx) { (void)ctx; return keymap_list(buf, cap); }
+
 static const struct vnode_ops exe_ops = { .readlink = link_exe, .nolock = true };
 static const struct vnode_ops cwd_ops = { .readlink = link_cwd, .nolock = true };
 static const struct vnode_ops root_ops = { .readlink = link_root, .nolock = true };
@@ -977,6 +1005,9 @@ void procfs_init(const char *mountpoint)
     pseudo_file(sk, "pid_max",   gen_sys_pid_max, NULL);
     pseudo_file(sk, "threads-max", gen_sys_pid_max, NULL);
     pseudo_file(sk, "yama_ptrace_scope", gen_sys_zero, NULL);
+    pseudo_file(sk, "keymaps",   gen_sys_keymaps, NULL);
+    struct vnode *km = vfs_node_new(m, "keymap", VREG, 0644, &keymap_ops);
+    if (km) vfs_node_add(sk, km);
     struct vnode *rnd = pseudo_dir(sk, "random");
     pseudo_file(rnd, "boot_id", gen_sys_boot_id, NULL);
     pseudo_file(rnd, "uuid",    gen_sys_uuid, NULL);

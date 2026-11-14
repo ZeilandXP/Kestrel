@@ -15,6 +15,7 @@
  */
 #include <kernel/usbhost.h>
 #include <kernel/keyboard.h>
+#include <kernel/keymap.h>
 #include <kernel/arch.h>
 #include <kernel/mm.h>
 #include <kernel/fb.h>
@@ -129,8 +130,18 @@ static void console_key(const struct usb_key_event *ev)
     uint8_t mods = 0;
     if (ev->modifiers & HID_MOD_SHIFT) mods |= MOD_SHIFT;
     if (ev->modifiers & HID_MOD_CTRL)  mods |= MOD_CTRL;
-    if (ev->modifiers & HID_MOD_ALT)   mods |= MOD_ALT;
+    if (ev->modifiers & HID_MOD_LALT)  mods |= MOD_ALT;
+    if (ev->modifiers & HID_MOD_RALT)  mods |= keymap_has_altgr() ? MOD_ALTGR : MOD_ALT;
+    if (ev->caps)                      mods |= MOD_CAPS;
     uint16_t key = usage_to_key(ev->usage);
+    uint8_t pos = key == KEY_CHAR ? keymap_hid_pos(ev->usage) : 0;
+    if (pos && keymap_handles(pos)) {           /* the main block: the layout's character */
+        char u[4];
+        size_t n = keymap_translate(pos, mods, u);
+        if (n) key_events++;
+        for (size_t i = 0; i < n; i++) keyboard_inject(KEY_CHAR, u[i], mods);
+        return;
+    }
     if (key == KEY_CHAR && !ev->ascii) return;  /* modifiers-only, unmapped keys */
     key_events++;
     keyboard_inject(key, ev->ascii, mods);

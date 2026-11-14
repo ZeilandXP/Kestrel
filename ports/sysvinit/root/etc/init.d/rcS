@@ -22,16 +22,26 @@ for s in /etc/rcS.d/S*; do
     [ -x "$s" ] && "$s" start
 done
 
-# A getty on every terminal there is (tty1 is the first monitor), logging
-# root in: /sbin/kestrel-autologin. For a login prompt instead, drop
-# "-n -l /sbin/kestrel-autologin" here.
+# An installed system's settings (kestrel-install): the keyboard layout of
+# the text terminals, and whether they log in by themselves.
+AUTOLOGIN=yes
+KESTREL_KEYMAP=
+[ -r /etc/default/kestrel ] && . /etc/default/kestrel
+[ -r /etc/default/keyboard ] && . /etc/default/keyboard
+[ -n "$KESTREL_KEYMAP" ] && echo "$KESTREL_KEYMAP" > /proc/sys/kernel/keymap 2>/dev/null
+
+# A getty on every terminal there is (tty1 is the first monitor). With
+# AUTOLOGIN=yes (the default, and the stick's) /sbin/kestrel-autologin logs
+# in without a password; AUTOLOGIN=no in /etc/default/kestrel: a login prompt.
+autologin="-n -l /sbin/kestrel-autologin "
+[ "$AUTOLOGIN" = no ] && autologin=
 mkdir -p /etc/inittab.d
 tab=/etc/inittab.d/ttys.tab
 : > "$tab.new"
 for t in /dev/tty[1-9] /dev/tty[1-9][0-9]; do
     [ -c "$t" ] || continue
     n=${t#/dev/tty}
-    echo "t$n:2345:respawn:/sbin/getty -n -l /sbin/kestrel-autologin 38400 tty$n" >> "$tab.new"
+    echo "t$n:2345:respawn:/sbin/getty ${autologin}38400 tty$n" >> "$tab.new"
 done
 mv "$tab.new" "$tab"
 kill -HUP 1                     # init reads the getty lines again

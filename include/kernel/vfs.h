@@ -70,6 +70,8 @@ struct vnode_ops {
     bool    (*stale)(struct vnode *dir);
     /* Optional, regular files: set the size (ftruncate, O_TRUNC). */
     int     (*truncate)(struct vnode *vn, uint64_t size);
+    /* Optional: fsync(2) of a device node (a disk: flush its write cache). */
+    int     (*fsync)(struct vnode *vn);
     /* Optional: the page-backed object holding the file's data, so that
      * MAP_SHARED mappings and read()/write() see the same bytes (ramfs,
      * memfd). NULL: no shared mappings of this file. */
@@ -349,6 +351,7 @@ void          pty_console_hangup(int idx);      /* session over: SIGHUP, fresh t
 
 struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
                              const struct vnode_ops *ops, void *ctx);
+void devfs_unregister(struct vnode *node);          /* the device is gone: its /dev name goes */
 void procfs_init(const char *mountpoint);
 void sysfs_init(const char *mountpoint);
 /* After boot, from drivers (fs/sysfs.c): a Linux driver bound to a PCI

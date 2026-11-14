@@ -26,8 +26,13 @@ uint64_t blk_size_bytes(const struct blkdev *b) { return b->blocks * b->block_si
 struct blkdev *blk_find(const char *name)
 {
     if (!strncmp(name, "/dev/", 5)) name += 5;
-    for (int i = 0; i < ndev; i++) if (!strcmp(devs[i]->name, name)) return devs[i];
-    return NULL;
+    struct blkdev *gone = NULL;                     /* a partition replaced by a new table */
+    for (int i = 0; i < ndev; i++)
+        if (!strcmp(devs[i]->name, name)) {
+            if (!devs[i]->removed) return devs[i];
+            gone = devs[i];
+        }
+    return gone;
 }
 
 const char *blk_strerror(int err)
@@ -226,22 +231,126 @@ static ssize_t node_read(struct vnode *vn, void *buf, size_t len, uint64_t off)
     int rc = blk_read_bytes(b, off, buf, len);
     return rc < 0 ? rc : (ssize_t)len;
 }
+/* ---- in use: mounted file systems, the boot volume ------------------------- */
+void blk_claim(struct blkdev *b)   { if (b) __atomic_add_fetch(&b->users, 1, __ATOMIC_RELAXED); }
+void blk_unclaim(struct blkdev *b) { if (b && b->users) __atomic_sub_fetch(&b->users, 1, __ATOMIC_RELAXED); }
+
+static uint64_t abs_start(const struct blkdev *b)
+{
+    uint64_t s = 0;
+    for (; b && b->parent; b = b->parent) s += b->start;
+    return s;
+}
+
+/* Would writing blocks [lba, lba + n) of b touch something in use? b
+ * itself or a disk it is part of, or a partition in use that the range
+ * overlaps (a whole-disk write must stay outside every mounted partition:
+ * the boot code before the first one, a partition table). */
+static bool range_busy(struct blkdev *b, uint64_t lba, uint64_t n)
+{
+    for (struct blkdev *x = b; x; x = x->parent) if (x->users) return true;
+    struct blkdev *disk = blk_disk_of(b);
+    uint64_t a = abs_start(b) + lba, e = a + n;
+    for (int i = 0; i < ndev; i++) {
+        struct blkdev *d = devs[i];
+        if (d == disk || d->removed || !d->users || blk_disk_of(d) != disk) continue;
+        uint64_t ds = abs_start(d), de = ds + d->blocks;
+        if (a < de && ds < e) return true;
+    }
+    return false;
+}
+
+bool blk_in_use(struct blkdev *b) { return b && range_busy(b, 0, b->blocks); }
+
+/* Writes from programs (the installer, mke2fs, dd): whole blocks go
+ * straight to the disk, a partial block at either end is read first. */
 static ssize_t node_write(struct vnode *vn, const void *buf, size_t len, uint64_t off)
 {
-    (void)vn; (void)buf; (void)len; (void)off;
-    return -EROFS;
+    struct blkdev *b = vn->ctx;
+    uint64_t size = blk_size_bytes(b);
+    if (!blk_disk_of(b)->ops->write) return -EROFS;
+    if (off >= size) return len ? -ENOSPC : 0;
+    if (len > size - off) len = (size_t)(size - off);
+    if (len > (1u << 20)) len = 1u << 20;           /* bounded per call */
+    uint32_t bs = b->block_size;
+    uint64_t first = off / bs, last = (off + len - 1) / bs;
+    if (range_busy(b, first, last - first + 1)) return -EBUSY;
+    size_t cap = BOUNCE_MAX;
+    uint8_t *bounce = kmalloc(cap);
+    if (!bounce) return -ENOMEM;
+    size_t done = 0;
+    int rc = 0;
+    while (done < len) {
+        uint64_t pos = off + done, lba = pos / bs;
+        uint32_t skip = (uint32_t)(pos % bs);
+        size_t chunk = cap - skip;
+        if (chunk > len - done) chunk = len - done;
+        uint32_t n = (uint32_t)((skip + chunk + bs - 1) / bs);
+        if (skip && (rc = blk_read(b, lba, 1, bounce)) < 0) break;
+        if ((skip + chunk) % bs && (n > 1 || !skip) && (rc = blk_read(b, lba + n - 1, 1, bounce + (size_t)(n - 1) * bs)) < 0)
+            break;
+        memcpy(bounce + skip, (const uint8_t *)buf + done, chunk);
+        if ((rc = blk_write(b, lba, n, bounce)) < 0) break;
+        done += chunk;
+    }
+    kfree(bounce);
+    if (rc < 0 && !done) return rc;
+    return (ssize_t)done;
 }
 static uint64_t node_size(struct vnode *vn) { return blk_size_bytes(vn->ctx); }
+
+/* The block-device requests programs ask: sizes, flush, re-read the table. */
+#define BLKRRPART     0x125F
+#define BLKGETSIZE    0x1260
+#define BLKFLSBUF     0x1261
+#define BLKSSZGET     0x1268
+#define BLKIOMIN      0x1278
+#define BLKIOOPT      0x1279
+#define BLKPBSZGET    0x127B
+#define BLKGETSIZE64  0x80081272
+#define HDIO_GETGEO   0x0301
+static int node_ioctl(struct vnode *vn, unsigned long req, void *arg)
+{
+    struct blkdev *b = vn->ctx;
+    switch ((uint32_t)req) {
+    case BLKGETSIZE64: *(uint64_t *)arg = blk_size_bytes(b); return 0;
+    case BLKGETSIZE:   *(uint64_t *)arg = blk_size_bytes(b) / 512; return 0;
+    case BLKSSZGET: case BLKPBSZGET: case BLKIOMIN:
+        *(uint32_t *)arg = b->block_size; return 0;
+    case BLKIOOPT:     *(uint32_t *)arg = 0; return 0;
+    case BLKFLSBUF:    return blk_flush(b);
+    case HDIO_GETGEO: {                              /* a made-up geometry, as Linux gives */
+        struct { uint8_t heads, sectors; uint16_t cylinders; uint32_t pad; uint64_t start; } *g = arg;
+        uint64_t sec = blk_size_bytes(b) / 512 / (255 * 63);
+        g->heads = 255; g->sectors = 63;
+        g->cylinders = (uint16_t)(sec > 0xFFFF ? 0xFFFF : sec);
+        g->start = abs_start(b) * b->block_size / 512;
+        return 0;
+    }
+    case BLKRRPART:
+        if (b->parent) return -EINVAL;
+        return blk_rescan(b) < 0 ? -EBUSY : 0;
+    }
+    return -ENOTTY;
+}
+static int node_fsync(struct vnode *vn) { return blk_flush(vn->ctx); }
 /* blk_read takes the big lock itself for a driver that needs it */
 static const struct vnode_ops node_ops = { .read = node_read, .write = node_write, .size = node_size,
-                                           .nolock = true };
+                                           .ioctl = node_ioctl, .fsync = node_fsync, .nolock = true };
 
+struct blkdev *blk_of_node(struct vnode *vn) { return vn && vn->ops == &node_ops ? vn->ctx : NULL; }
+
+/* /dev/<name>: root and the disk group (6) may read and write. */
 void blk_publish(void)
 {
     for (int i = 0; i < ndev; i++) {
         struct blkdev *b = devs[i];
-        if (b->node) continue;
-        b->node = devfs_register(b->name, 0440, (uint32_t)(BLK_MAJOR << 8 | (i & 0xFF)), &node_ops, b);
+        if (b->node || b->removed) continue;
+        b->node = devfs_register(b->name, 0660, (uint32_t)(BLK_MAJOR << 8 | (i & 0xFF)), &node_ops, b);
+        if (b->node) {                              /* a block device, for stat(2) */
+            b->node->gid = 6;
+            b->node->mode = (b->node->mode & ~S_IFMT) | S_IFBLK;
+        }
     }
 }
 
@@ -470,6 +579,24 @@ int blk_scan_partitions(struct blkdev *disk)
     kfree(sec0);
     kfree(buf);
     return rc;
+}
+
+/* A program wrote a new partition table: forget the old partitions and read
+ * the table again. Refused while any partition of the disk is in use. */
+int blk_rescan(struct blkdev *disk)
+{
+    if (!disk || disk->parent || disk->removed) return -EINVAL;
+    for (int i = 0; i < ndev; i++)
+        if (blk_disk_of(devs[i]) == disk && !devs[i]->removed && devs[i]->users) return -EBUSY;
+    for (int i = 0; i < ndev; i++) {
+        struct blkdev *p = devs[i];
+        if (p == disk || p->removed || blk_disk_of(p) != disk) continue;
+        p->removed = true;
+        if (p->node) { devfs_unregister(p->node); p->node = NULL; }
+    }
+    disk->partitions_scanned = false;
+    kprintf("block: %s: reading the partition table again\n", disk->name);
+    return blk_scan_partitions(disk);
 }
 
 /* ======================================================================== */

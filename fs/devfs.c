@@ -499,6 +499,14 @@ struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
     return dir ? d : NULL;
 }
 
+void devfs_unregister(struct vnode *node)
+{
+    if (!node) return;
+    vfs_tree_lock(true);
+    if (node->parent) vfs_node_drop(node->parent, node);
+    vfs_tree_unlock();
+}
+
 void devfs_init(const char *mountpoint)
 {
     struct mount *m;

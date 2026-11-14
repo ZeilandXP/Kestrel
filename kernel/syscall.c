@@ -11,6 +11,7 @@
 #include <kernel/sysvshm.h>
 #include <kernel/power.h>
 #include <kernel/block.h>
+#include <kernel/ext2.h>
 #include <kernel/syscall.h>
 #include <kernel/process.h>
 #include <kernel/mm.h>
@@ -519,6 +520,10 @@ static const struct { uint32_t req; uint16_t size; uint8_t dir; } ioctl_args[] =
     { KFB_GET_MODES, sizeof(struct kfb_modes), IOC_OUT }, { KFB_SET_MODE, sizeof(struct kfb_mode), IOC_IN },
     { FBIOGET_VSCREENINFO, sizeof(struct fb_var_screeninfo_lite), IOC_OUT },
     { KINPUT_GRAB, 4, IOC_IN },
+    { 0x80081272 /* BLKGETSIZE64 */, 8, IOC_OUT }, { 0x1260 /* BLKGETSIZE */, 8, IOC_OUT },
+    { 0x1268 /* BLKSSZGET */, 4, IOC_OUT }, { 0x127B /* BLKPBSZGET */, 4, IOC_OUT },
+    { 0x1278 /* BLKIOMIN */, 4, IOC_OUT }, { 0x1279 /* BLKIOOPT */, 4, IOC_OUT },
+    { 0x0301 /* HDIO_GETGEO */, 16, IOC_OUT },
 };
 
 /* SIOC* requests: struct ifreq / rtentry in and out; SIOCGIFCONF fills the
@@ -1284,7 +1289,8 @@ static int64_t sys_fsync(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uin
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
     struct mount *m = f->vn ? f->vn->fs : NULL;
-    int r = m && m->sync ? m->sync(m, false) : 0;       /* the whole volume: simple and safe */
+    int r = f->vn && f->vn->ops && f->vn->ops->fsync ? f->vn->ops->fsync(f->vn) :  /* a disk */
+            m && m->sync ? m->sync(m, false) : 0;      /* the whole volume: simple and safe */
     fput(f);
     return r;
 }
@@ -3628,6 +3634,17 @@ static int64_t sys_mount(uint64_t usrc, uint64_t utarget, uint64_t utype, uint64
     } else if (!strcmp(type, "devpts")) {
         if ((r = vfs_lookup("/dev/pts", &sv)) < 0) { r = -ENODEV; goto out; }
         r = vfs_bind_node(sv, canon, "devpts");
+    } else if (!strcmp(type, "ext2") || !strcmp(type, "ext3") || !strcmp(type, "ext4")) {
+        /* a disk's file system: the installer's target, a second volume */
+        if ((r = vfs_lookup(src, &sv)) < 0) goto out;
+        struct blkdev *b = blk_of_node(sv);
+        if (!b) { r = -ENOTBLK; goto out; }
+        if (blk_in_use(b)) { r = -EBUSY; goto out; }
+        if (!ext2_probe(b, NULL)) { r = -EINVAL; goto out; }
+        struct mount *m;
+        if ((r = ext2_mount(b, mf & MNT_RDONLY, &m)) < 0) goto out;
+        m->flags |= mf;
+        if ((r = vfs_mount(m, canon)) < 0) m->umount(m);
     } else if (!strcmp(type, "fuse") || !strncmp(type, "fuse.", 5)) {
         char full[64];
         const char *sub = strstr(opts, "subtype=");

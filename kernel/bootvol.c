@@ -171,6 +171,7 @@ static int try_candidate(struct blkdev *dev, uint64_t hdr_block, const char *met
         return rc;
     }
     st.result = BV_MOUNTED;
+    blk_claim(dev);                                     /* mounted: no writes from programs */
     vfs_bind("/boot/bin", "/bin");                      /* /bin/sh and friends where POSIX expects them */
     struct vnode *libdir;
     if (vfs_lookup("/boot/lib", &libdir) == 0) {        /* the dynamic loader and shared libraries */
@@ -204,6 +205,13 @@ static int try_disk(struct blkdev *disk)
         if (!method) continue;
         int rc = try_candidate(p, 0, method);
         if (rc == 0) return 0;
+        /* An installed system's partition holds two volumes, one in each
+         * half: the updater writes the next release into the other half. */
+        if (p->blocks >= 2 * KESTREL_SLOT_MIN_BLOCKS) {
+            int rc2 = try_candidate(p, p->blocks / 2, "option A, second half (updated system)");
+            if (rc2 == 0) return 0;
+            if (rc == -ENOENT) rc = rc2;
+        }
         if (rc != -ENOENT && rc != -EINVAL) io_err = rc;
     }
 
@@ -238,9 +246,62 @@ static int try_disk(struct blkdev *disk)
  * so the other disks are searched once too. */
 static bool usb_fallback;
 
+/* kestrel.esp=: the partition GRUB loaded the kernel from, as GRUB's
+ * probe --part-uuid prints it ("1a2b3c4d-04" on an MBR disk: the disk
+ * signature and the partition number; a GUID on a GPT disk). The boot
+ * volume is looked for on that disk alone, as long as it may still appear:
+ * a stick and an installed copy in one PC each boot their own system. */
+static char want_esp[40];
+static bool esp_fallback;
+static int8_t esp_match[BLK_MAX];                   /* 0 unknown, 1 the boot disk, -1 not */
+
+static bool is_boot_disk(struct blkdev *disk, int idx)
+{
+    if (idx >= 0 && idx < BLK_MAX && esp_match[idx]) return esp_match[idx] > 0;
+    bool yes = false;
+    if (!disk->partitions_scanned) blk_scan_partitions(disk);
+    size_t n = strlen(want_esp);
+    if (n == 11 && want_esp[8] == '-') {            /* MBR: signature at byte 440 */
+        uint8_t *sec = kmalloc(disk->block_size);
+        uint32_t sig = 0, part = 0;
+        bool ok = true;
+        for (int i = 0; i < 8; i++) { int v = hexval(want_esp[i]); if (v < 0) ok = false; sig = sig << 4 | (uint32_t)(v & 15); }
+        for (int i = 9; i < 11; i++) { int v = hexval(want_esp[i]); if (v < 0) ok = false; part = part << 4 | (uint32_t)(v & 15); }
+        if (ok && sec && blk_read(disk, 0, 1, sec) == 0 && sec[510] == 0x55 && sec[511] == 0xAA) {
+            uint32_t got;
+            memcpy(&got, sec + 440, 4);
+            if (got == sig)
+                for (int i = 0; i < blk_count(); i++) {
+                    struct blkdev *p = blk_get(i);
+                    if (p->parent == disk && !p->removed && !p->gpt && p->part_no == (int)part) { yes = true; break; }
+                }
+        }
+        kfree(sec);
+    } else {                                        /* GPT: the partition's unique GUID */
+        for (int i = 0; i < blk_count(); i++) {
+            struct blkdev *p = blk_get(i);
+            char g[37];
+            if (p->parent != disk || p->removed || !p->gpt) continue;
+            blk_guid_str(p->part_guid, g);
+            bool same = strlen(g) == n;
+            for (size_t k = 0; same && k < n; k++)
+                if ((g[k] | 0x20) != (want_esp[k] | 0x20)) same = false;
+            if (same) { yes = true; break; }
+        }
+    }
+    if (idx >= 0 && idx < BLK_MAX) esp_match[idx] = yes ? 1 : -1;
+    if (yes) kprintf("bootvol: %s is the disk GRUB started from (kestrel.esp=%s)\n", disk->name, want_esp);
+    return yes;
+}
+
 static bool wanted(const struct blkdev *b)
 {
     if (b->parent || b->removed) return false;
+    if (want_esp[0] && !esp_fallback) {
+        for (int i = 0; i < blk_count() && i < BLK_MAX; i++)
+            if (blk_get(i) == b) return is_boot_disk((struct blkdev *)b, i);
+        return false;
+    }
     if (!strcmp(st.policy, "usb") && !usb_fallback)
         return b->kind == BLK_DISK_USB || b->kind == BLK_DISK_VIRTIO;   /* a VM's "stick" */
     return true;                                    /* auto / any */
@@ -280,6 +341,14 @@ static int discover(void)
 
         now = time_ms();
         bool busy = settling != 0 || usb_storage_pending() > 0;
+        if (want_esp[0] && !esp_fallback && (now >= deadline || (!mandatory && !busy))) {
+            kprintf("bootvol: the disk with partition %s did not appear; searching as kestrel.root=%s says\n",
+                    want_esp, st.policy);
+            esp_fallback = true;
+            memset(examined, 0, sizeof examined);
+            deadline = now + st.rootwait_ms;
+            continue;
+        }
         if (now >= deadline && !io_err && !usb_fallback && !strcmp(st.policy, "usb")) {
             kprintf("bootvol: no Kestrel stick on USB, searching the other disks (an installed copy)\n");
             usb_fallback = true;
@@ -355,6 +424,7 @@ int bootvol_mount_root(void)
         st.rootwait_ms = ms < 0 ? 0 : ms > (long)ROOTWAIT_MAX ? ROOTWAIT_MAX : (uint32_t)ms;
     }
     st.verify = !(cmdline_get("kestrel.rootverify", v, sizeof v) && v[0] == '0');
+    if (!cmdline_get("kestrel.esp", want_esp, sizeof want_esp)) want_esp[0] = 0;
     if (cmdline_get("kestrel.uuid", v, sizeof v)) {
         have_want_uuid = parse_uuid(v, want_uuid);
         if (have_want_uuid) bootvol_uuid_str(want_uuid, st.want_uuid);

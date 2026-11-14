@@ -25,7 +25,9 @@ struct ustar {
 } __attribute__((packed));
 _Static_assert(sizeof(struct ustar) == TAR_BLOCK, "ustar header is 512 bytes");
 
-struct tar_file { struct blkdev *dev; uint64_t offset; };
+/* One per file's data; its hard links ('1') share it, and with it the
+ * inode number and the link count stat shows (cp -a, the installer). */
+struct tar_file { struct blkdev *dev; uint64_t offset; uint64_t ino; uint32_t links; };
 
 static uint64_t octal(const char *s, size_t n)
 {
@@ -71,7 +73,13 @@ static ssize_t tar_write(struct vnode *vn, const void *buf, size_t len, uint64_t
     return -EROFS;
 }
 /* blk_read takes the big lock itself for a driver that needs it */
-static const struct vnode_ops tar_file_ops = { .read = tar_read, .write = tar_write, .nolock = true };
+static void tar_getattr(struct vnode *vn)
+{
+    const struct tar_file *tf = vn->ctx;
+    vn->ino = tf->ino;
+    vn->nlink = tf->links;
+}
+static const struct vnode_ops tar_file_ops = { .read = tar_read, .write = tar_write, .getattr = tar_getattr, .nolock = true };
 
 /* ---- tree construction ------------------------------------------------------ */
 static struct vnode *child(struct vnode *dir, const char *name)
@@ -208,6 +216,7 @@ int tarfs_mount(struct blkdev *dev, uint64_t offset, uint64_t length, const char
                 if (!vn) { rc = -ENOMEM; break; }
                 vn->ctx = t->ctx;                       /* same data on the device */
                 vn->size = t->size;
+                ((struct tar_file *)t->ctx)->links++;
                 vfs_node_add(dir, vn);
                 st.files++;
             } else if (!t) {
@@ -226,7 +235,9 @@ int tarfs_mount(struct blkdev *dev, uint64_t offset, uint64_t length, const char
             if (!vn) { kfree(tf); rc = -ENOMEM; break; }
             tf->dev = dev;
             tf->offset = offset + data;
+            tf->links = 1;
             vn->ctx = tf;
+            tf->ino = vn->ino;
             vn->size = size;
             vfs_node_add(dir, vn);
             st.files++;

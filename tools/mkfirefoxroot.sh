@@ -270,6 +270,17 @@ Icon=utilities-terminal
 Terminal=false
 Categories=System;TerminalEmulator;
 EOF
+# The installer (/boot/bin/kestrel-install, full screen in a terminal)
+cat > "$ROOT/usr/share/applications/kestrel-install.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Install Kestrel
+Comment=Install Kestrel on a disk of this computer (beta)
+Exec=xterm -T "Install Kestrel" -geometry 100x34 -e sh -c '/boot/bin/kestrel-install || { echo; echo "Press Enter to close this window."; read x; }'
+Icon=drive-harddisk
+Terminal=false
+Categories=System;
+EOF
 # The session: Openbox, the panel and PCManFM's desktop. No screen saver
 # or locker, and no autostart entries for services Kestrel lacks: lxpolkit
 # needs polkitd on a system bus, light-locker needs LightDM, and PulseAudio's
@@ -371,6 +382,9 @@ Plugin {
         }
         Button {
             id=lxterminal.desktop
+        }
+        Button {
+            id=kestrel-install.desktop
         }
     }
 }

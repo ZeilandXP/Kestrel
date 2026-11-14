@@ -1,4 +1,10 @@
 #!/bin/sh
 # /sbin/kestrel-autologin: what getty runs on Kestrel's terminals (see
-# /etc/init.d/rcS): a login session for root, with no password asked.
+# /etc/init.d/rcS): a login session with no password asked, for root, or on
+# an installed system for its user (AUTOLOGIN_USER in /etc/default/kestrel).
+AUTOLOGIN_USER=
+[ -r /etc/default/kestrel ] && . /etc/default/kestrel
+if [ -n "$AUTOLOGIN_USER" ] && grep -q "^$AUTOLOGIN_USER:" /etc/passwd 2>/dev/null; then
+    exec login -f "$AUTOLOGIN_USER"
+fi
 exec login -f root

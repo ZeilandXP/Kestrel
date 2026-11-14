@@ -75,7 +75,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/lockcheck.c kerne
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/fuse.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kfont_10.c drivers/kfont_12.c drivers/kfont_15.c drivers/image.c drivers/halt_screen.c \
-           kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c kernel/installer.c kernel/stopscreen.c kernel/vbe_emu.c \
+           kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c kernel/keymap.c kernel/stopscreen.c kernel/vbe_emu.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
            drivers/gpu/nvidia/nvinit.c drivers/gpu/nvidia/nvdisp.c drivers/gpu/nvidia/nvidia.c kernel/gpu.c kernel/kush.c \
            kernel/coreutils/cu_lib.c kernel/coreutils/table.c kernel/coreutils/nav.c \
@@ -387,12 +387,43 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
 MUSL_PROGS  := libctest sandboxtest nstest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat wdtest drmtest evdevtest apptest fusermount3
-USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS) nopietest))
+USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS) nopietest kestrel-install))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c
 	@mkdir -p $(dir $@)
 	@echo "  MUSLCC  $<"
 	@$(MUSL_CC) $(MUSL_CFLAGS) $< -o $@
+
+# The installer (beta): user/install/*.c, one program
+INSTALL_SRC := $(wildcard user/install/*.c)
+$(BUILD)/user/kestrel-install: $(INSTALL_SRC) user/install/install.h
+	@mkdir -p $(dir $@)
+	@echo "  MUSLCC  user/install -> kestrel-install"
+	@$(MUSL_CC) $(MUSL_CFLAGS) -Wno-format-truncation -Wno-restrict $(INSTALL_SRC) -o $@
+
+# What the installer puts on a disk, in the boot volume's share/kestrel/boot:
+# GRUB's boot.img, a core.img and a BOOTX64.EFI for installed systems (the
+# stick's menu without the stick's own entries; the settings come from the
+# EFI System Partition's boot/grub/local.cfg), and the kernel.
+INSTALL_BOOT := $(BUILD)/install-boot
+GRUB_INSTALL_MODS := normal configfile echo multiboot2 video video_fb test part_msdos part_gpt fat search probe \
+                     chain ntfs ext2 linux gzio loadenv
+$(INSTALL_BOOT)/.stamp: $(STRIPPED) boot/grub/grub-usb.cfg $(BUILD)/cmdline.stamp
+	@test -n "$(GRUB_MKIMAGE)" || { echo "error: grub-mkimage not found"; exit 1; }
+	@rm -rf $(INSTALL_BOOT)
+	@mkdir -p $(INSTALL_BOOT)/memdisk/boot/grub
+	@sed -e 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' -e 's|@GRUB_DEFAULT@|0|' -e '/@ESP_UUID@/d' -e '/@BENCH_ENTRIES@/d' \
+	    boot/grub/grub-usb.cfg > $(INSTALL_BOOT)/memdisk/boot/grub/grub.cfg
+	@tar --format=ustar -C $(INSTALL_BOOT)/memdisk -cf $(INSTALL_BOOT)/memdisk.tar boot
+	@echo "  GRUB    core.img, BOOTX64.EFI (installed systems)"
+	@$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_LIB)/i386-pc -o $(INSTALL_BOOT)/core.img -p '(memdisk)/boot/grub' \
+	    -m $(INSTALL_BOOT)/memdisk.tar biosdisk memdisk tar vbe $(GRUB_INSTALL_MODS)
+	@cp $(GRUB_LIB)/i386-pc/boot.img $(INSTALL_BOOT)/boot.img
+	@if [ -d "$(GRUB_LIB)/x86_64-efi" ]; then \
+	    $(GRUB_MKIMAGE) -O x86_64-efi -d $(GRUB_LIB)/x86_64-efi -o $(INSTALL_BOOT)/bootx64.efi -p '(memdisk)/boot/grub' \
+	        -m $(INSTALL_BOOT)/memdisk.tar memdisk tar efi_gop efi_uga $(GRUB_INSTALL_MODS); fi
+	@cp $(STRIPPED) $(INSTALL_BOOT)/kernel.elf
+	@touch $@
 
 # Linked at a fixed low address (ET_EXEC): the kernel's low window (uvm.h).
 $(BUILD)/user/nopietest: user/nopietest.c
@@ -483,11 +514,14 @@ $(BUILD)/nvfw.stamp: FORCE
 	@echo '$(abspath $(NVIDIA_FW))' | cmp -s - $@ || echo '$(abspath $(NVIDIA_FW))' > $@
 
 $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp) $(wildcard $(SYSVINIT_ROOT)/.stamp) \
-                       $(BUILD)/nvfw.stamp $(NVIDIA_FW) tools/nvfirmware.py
+                       $(shell find ports/sysvinit/root -type f) $(BUILD)/nvfw.stamp $(NVIDIA_FW) tools/nvfirmware.py $(if $(GRUB_MKIMAGE),$(INSTALL_BOOT)/.stamp)
 	@rm -rf $(ROOTFS_STAGE)
 	@mkdir -p $(ROOTFS_STAGE)/bin
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
 	@cp $(USER_PROGS) $(ROOTFS_STAGE)/bin/
+	@if [ -f $(INSTALL_BOOT)/.stamp ]; then mkdir -p $(ROOTFS_STAGE)/share/kestrel/boot && \
+	    cp $(INSTALL_BOOT)/boot.img $(INSTALL_BOOT)/core.img $(INSTALL_BOOT)/kernel.elf $(ROOTFS_STAGE)/share/kestrel/boot/ && \
+	    if [ -f $(INSTALL_BOOT)/bootx64.efi ]; then cp $(INSTALL_BOOT)/bootx64.efi $(ROOTFS_STAGE)/share/kestrel/boot/; fi; fi
 	@install -m 755 user/shtest.sh $(ROOTFS_STAGE)/bin/shtest.sh
 	@chmod 4755 $(ROOTFS_STAGE)/bin/fusermount3   # libfuse looks for a setuid one
 	@ln -sf fusermount3 $(ROOTFS_STAGE)/bin/fusermount
@@ -497,7 +531,8 @@ $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) u
 	@if [ -f $(ICEWM_ROOT)/.stamp ]; then cp -r $(ICEWM_ROOT)/bin $(ICEWM_ROOT)/share $(ICEWM_ROOT)/etc $(ROOTFS_STAGE)/; fi
 	@if [ -f $(BUSYBOX_ROOT)/.stamp ]; then cp -a $(BUSYBOX_ROOT)/bin $(ROOTFS_STAGE)/; fi   # -a: keep the hard links
 	@if [ -f $(XTERM_ROOT)/.stamp ]; then cp -r $(XTERM_ROOT)/bin $(XTERM_ROOT)/share $(ROOTFS_STAGE)/; fi
-	@if [ -f $(SYSVINIT_ROOT)/.stamp ]; then cp -a $(SYSVINIT_ROOT)/sbin $(SYSVINIT_ROOT)/etc $(SYSVINIT_ROOT)/run $(ROOTFS_STAGE)/; fi
+	@if [ -f $(SYSVINIT_ROOT)/.stamp ]; then cp -a $(SYSVINIT_ROOT)/sbin $(SYSVINIT_ROOT)/etc $(SYSVINIT_ROOT)/run $(ROOTFS_STAGE)/ && \
+	    cp -a ports/sysvinit/root/. $(ROOTFS_STAGE)/; fi   # the boot scripts as they are now
 	@if [ -n "$(NVIDIA_FW)" ]; then $(PYTHON) tools/nvfirmware.py $(NVIDIA_FW) $(ROOTFS_STAGE); fi
 	@touch $@
 
@@ -567,13 +602,13 @@ $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg boot/grub/grub-bench.cfg tools/mku
 	@$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_LIB)/i386-pc -o $(BUILD)/usb-core.img \
 	    -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
 	    biosdisk memdisk tar normal configfile echo multiboot2 vbe video video_fb test \
-	    part_msdos part_gpt fat search $(if $(BENCH_LINUX),linux)
+	    part_msdos part_gpt fat search probe chain ntfs ext2 $(if $(BENCH_LINUX),linux)
 	@if [ -f $(BUILD)/usb-esp.img ]; then \
 	    echo "  GRUB    BOOTX64.EFI (USB, memdisk)"; \
 	    $(GRUB_MKIMAGE) -O x86_64-efi -d $(GRUB_LIB)/x86_64-efi -o $(BUILD)/usb-bootx64.efi \
 	        -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
 	        memdisk tar normal configfile echo multiboot2 efi_gop efi_uga video video_fb test \
-	        part_msdos part_gpt fat search $(if $(BENCH_LINUX),linux) && \
+	        part_msdos part_gpt fat search probe chain ntfs ext2 $(if $(BENCH_LINUX),linux) && \
 	    MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(BUILD)/usb-bootx64.efi ::/EFI/BOOT/BOOTX64.EFI; \
 	else echo "  (no GRUB x86_64-efi files or mtools: BIOS-only stick)"; fi
 	@echo "  USBIMG  $@"

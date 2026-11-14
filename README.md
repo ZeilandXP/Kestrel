@@ -524,15 +524,50 @@ Tested in QEMU (q35, `qemu-xhci`, `usb-storage`) for each of these situations:
 | EHCI with three UHCI companions (pc machine) | handoff logged |
 | Floppy and q35/AHCI | boots without regressions |
 
-### Installing onto a disk (alpha)
+### Installing Kestrel (beta)
 
-`/boot/bin/kestrel-install` (run as root, best from the text console) copies the stick onto a SATA or NVMe disk of the PC. **Everything on that disk is erased.** It lists the disks that can take the copy, asks for the disk's name and then for the name again with "yes", and shows the progress. The copy itself is done by the kernel (`kernel/installer.c`, `/dev/install`): it syncs the root file system, zeroes the disk's last 33 sectors (an old backup GPT), then copies the stick from sector 0 to the end of its last partition (GRUB, the boot volume, the ext2 root, the EFI System Partition, the report volume) in 256 KiB requests, and flushes the disk.
+**Install Kestrel** on the desktop (or `kestrel-install` as root on a text terminal) puts Kestrel on a disk of the PC, from the stick, from the ISO (also when Ventoy started it) or from an installed Kestrel. It is a full-screen program in the steps of Ubuntu's installer; Esc goes back a step, and nothing is written before the last one, which lists every change and asks to confirm:
 
-The copy boots like the stick, by BIOS and by UEFI: `kestrel.root=usb` searches the other disks once when no stick has appeared within `rootwait`, which adds about 3 s to each boot from the disk. The ext2 root on the boot volume's own disk is preferred, so a stick plugged into a PC with Kestrel installed still uses its own root.
+1. **Welcome**: Install Kestrel, or Try Kestrel (leave the installer).
+2. **Keyboard**: English (US), English (UK), German, French (AZERTY), Spanish or Italian. The layout applies at once (on the text terminals through `/proc/sys/kernel/keymap`, on the desktop with `setxkbmap`), with a field to try it.
+3. **Installation type**: *Erase disk and install Kestrel*; *Install Kestrel alongside* the systems it found (Windows, Linux, another Kestrel); or *Something else*.
+4. **Disk**: the disk to erase; the free space to use; or, for something else, also the whole disk or a partition to replace (with the free space around it), then the size of Kestrel's file system.
+5. **Where are you?**: the time zone (61 cities; the hardware clock is taken as UTC).
+6. **Who are you?**: your name, the computer's name, a username and a password (root gets the same one), then *Log in automatically* or *Require my password to log in*.
+7. **Write the changes to disks?**, the progress, and *Restart now* or *Continue testing*. The log is `/var/log/kestrel-install.log` (and on the installed system too).
 
-Alpha limits: only whole disks (no dual boot), 512-byte sectors, MBR sticks; the installed root keeps the stick's size; the disk with the mounted root and the stick itself are refused. Writing `install <disk>` to `/dev/install` starts a copy; reading it gives `state`, `source`, `progress` (MiB), `error` and one `disk` line per disk that can take the copy.
+Kestrel takes three partitions: an EFI System Partition (256 MiB, FAT32: GRUB for UEFI, the kernel as `boot/kernel-a.elf`, and `boot/grub/local.cfg` with this system's settings), the boot volume (two slots of three times the volume's size, at least 512 MiB each, for the updater) and the ext2 root (`kestrel-root`, made with BusyBox's `mke2fs`, the rest of the space). GRUB goes into the MBR and the sectors before the first partition. Alongside other systems the three are primary partitions if the table has three free entries, else logical ones in a new extended partition; the other partitions stay as they are.
 
-Tested in QEMU (q35): installed from the stick onto a blank SATA disk, then booted that disk alone to the LXDE desktop under SeaBIOS and under OVMF; with the stick plugged in as well, the stick boots and keeps its own root.
+What it installs comes from the running system: GRUB's images for installed systems and the kernel from `/boot/share/kestrel/boot` (`make` builds them), the boot volume copied from its device (`/proc/bootvol`; on the ISO the module's RAM disk) with a new UUID, and the root's files (the root file system's, or the boot volume's when the root is in memory) with their owners, modes, times and hard links. The account, host name, time zone (`/etc/localtime`), keyboard (`/etc/default/keyboard`) and login setting (`/etc/default/kestrel`) are then written into the new root.
+
+The installed system starts by BIOS and by UEFI. Its GRUB menu has the desktop and text-console entries, then the other systems on the PC's disks: Windows through its boot loader (`bootmgr` on BIOS, `bootmgfw.efi` on UEFI) and Linux through its own GRUB menu. The desktop's X server runs as root and the desktop as your account: started by itself with *Log in automatically*, else after a login in a window, which comes back when you log out; the text terminals log you in, or ask for the password.
+
+```
+kestrel-install --list           the disks, their partitions, and what each offers
+kestrel-install --auto FILE      no questions; FILE has key=value lines:
+    mode=erase | something       disk=sata0      region=N (a free space from --list)
+    replace=N (a primary partition)              root_mib=N
+    user=  password=  fullname=  hostname=  autologin=yes|no
+    keyboard=us|gb|de|fr|es|it   timezone=Europe/London    reboot=yes|no
+```
+
+Beta limits: MBR partition tables only (a GPT disk can only be erased: installing next to it would need UEFI boot entries, which Kestrel cannot write yet); free space inside an existing extended partition is not used; disks with 512-byte sectors, up to 2 TiB; a UEFI PC starts the EFI System Partition only from a primary partition, so an installation in logical partitions starts by BIOS (legacy/CSM) only. On BIOS, GRUB takes the settings of the first disk that has them, which is the boot disk unless several disks carry an installed Kestrel; on UEFI the first such disk in the firmware's order. The disk Kestrel runs from and Ventoy sticks are not offered.
+
+Tested in QEMU (q35), each installation then started from its disk alone: erasing a blank disk from the stick under SeaBIOS and under OVMF; alongside a disk with a FAT partition holding `bootmgr` and an ext4 Linux with its GRUB menu (logical partitions; GRUB lists both and opens the Linux menu); replacing that Linux partition (something else, primary partitions); from the ISO; and from the ISO started by Ventoy 1.0.99, under SeaBIOS and under OVMF. Password login on the terminals, automatic login as the new user, the UK and German layouts and the time zone checked on the installed systems; with the stick plugged in as well, the stick starts its own kernel and root.
+
+### The ISO through Ventoy
+
+The ISO boots from a Ventoy stick in Ventoy's normal mode, BIOS and UEFI: GRUB on the ISO loads the kernel and the boot volume as Multiboot2 modules, and the boot volume becomes `/dev/ram0`, so nothing needs to find the ISO file again.
+
+### Keyboard layouts
+
+The text terminals translate keys with the layout of `kestrel.keymap=` (`us` by default, `gb`, `de`, `fr`, `es`, `it`; `kernel/keymap.c`): four levels each, right Alt as AltGr, characters sent as UTF-8, no dead keys. `/proc/sys/kernel/keymap` shows the layout and takes a new one (CAP_SYS_ADMIN); `/proc/sys/kernel/keymaps` lists them. The PS/2 and USB keyboards both go through it.
+
+### Disks for programs
+
+`/dev/sata0`, `/dev/sata0p1` and the others are block devices (mode 0660, group 6) that programs read and write: `pread`/`pwrite` at any offset, `fsync`, and the ioctls `BLKGETSIZE64`, `BLKGETSIZE`, `BLKSSZGET`, `BLKPBSZGET`, `BLKIOMIN`, `BLKIOOPT`, `BLKFLSBUF`, `HDIO_GETGEO` and `BLKRRPART` (read the partition table again; the old partitions' nodes go). A write is refused (`EBUSY`) on a mounted partition, on the boot volume, and on a whole disk where it would touch one of those. `mount -t ext2` (or ext3, ext4) mounts an ext2 volume from such a device, `umount` writes it back and marks it clean.
+
+GRUB tells the kernel which disk it started from with `kestrel.esp=` (the EFI System Partition's partition UUID, as `probe --part-uuid` gives it); the kernel looks for its boot volume there first, then by `kestrel.root=`. A boot volume partition of 2 MiB or more has two slots, the header at its start and at its middle; `kestrel.uuid=` picks the one to mount.
 
 ## Source layout
 
@@ -631,7 +666,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               stopscreen.c   the red 800x600 panic screen (Kestrel 10), VBE mode switch on BIOS
               vbe_emu.c      VBE calls into the video BIOS through the x86emu emulator (no real mode)
               report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume, /dev/report
-              installer.c    /dev/install: copies the stick onto a SATA/NVMe disk (alpha)
+              keymap.c       keyboard layouts of the text terminals (kestrel.keymap=)
               gpu.c          PCI -> NVIDIA probe glue, 'gpu' command, report section
               display.c      display heads: the boot frame buffer, then the drivers' monitors
               tty.c          one terminal per monitor: draw_char/scroll_screen per TTY, cell
@@ -669,6 +704,9 @@ ports/busybox/               BusyBox build (/bin/sh and the command-line tools)
 ports/sysvinit/              SysVinit build, inittab and boot scripts (the ext2 root's init)
 ports/xterm/                 xterm build and its musl patch
 rootfs/                      contents of the boot volume payload
+user/install/                kestrel-install, the installer (beta): ui.c text interface, disk.c
+                             disks and partition tables, fat.c the EFI partition, copy.c files,
+                             setup.c accounts and settings, install.c the steps
 ui/bootmgr.c                 boot manager, F8 screen, tools
 linuxkpi/                    the Linux KPI: build unmodified Linux drivers (see "Linux drivers")
   include/linux/ asm/ uapi/  the KPI's own Linux API headers (written here, none copied from Linux)

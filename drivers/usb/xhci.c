@@ -1506,6 +1506,7 @@ static void emit_key(const struct usb_dev *d, uint8_t usage, uint8_t mods, bool 
     struct usb_key_event ev = {
         .usage = usage, .modifiers = mods, .pressed = pressed, .repeat = repeat,
         .ascii = pressed ? usb_hid_usage_to_ascii(usage, mods, X.caps_lock) : 0,
+        .caps = X.caps_lock,
         .device = device_index(d),
     };
     X.plat.on_key(&ev);

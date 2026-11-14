@@ -1085,18 +1085,24 @@ ssize_t vfs_read(struct file *f, void *buf, size_t len)
 
 /* Read at an offset without touching the file position (page faults of
  * file mappings, the ELF loader, pread64). Regular files only. */
+/* pread/pwrite: regular files, and the block devices' nodes (/dev/sata0...) */
+static bool positioned(const struct vnode *vn)
+{
+    return vn->type == VREG || (vn->type == VCHR && (vn->mode & S_IFMT) == S_IFBLK);
+}
+
 ssize_t vfs_pread(struct file *f, void *buf, size_t len, uint64_t off)
 {
     if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     if (f->vn->type == VDIR) return -EISDIR;
-    if (f->vn->type != VREG || !f->vn->ops || !f->vn->ops->read) return -ESPIPE;
+    if (!positioned(f->vn) || !f->vn->ops || !f->vn->ops->read) return -ESPIPE;
     return f->vn->ops->read(f->vn, buf, len, off);
 }
 
 ssize_t vfs_pwrite(struct file *f, const void *buf, size_t len, uint64_t off)
 {
     if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
-    if (f->vn->type != VREG || !f->vn->ops || !f->vn->ops->write) return -ESPIPE;
+    if (!positioned(f->vn) || !f->vn->ops || !f->vn->ops->write) return -ESPIPE;
     ssize_t n = f->vn->ops->write(f->vn, buf, len, off);
     if (n > 0) { f->vn->mtime = (uint64_t)time_realtime_sec(); inotify_self(f->vn, IN_MODIFY); }
     return n;
@@ -1143,7 +1149,7 @@ static uint8_t dtype(struct vnode *vn)
 {
     switch (vn->type) {
     case VDIR:  return DT_DIR;
-    case VCHR:  return DT_CHR;
+    case VCHR:  return (vn->mode & S_IFMT) == S_IFBLK ? DT_BLK : DT_CHR;
     case VREG:  return DT_REG;
     case VLNK:  return DT_LNK;
     case VSOCK: return DT_SOCK;

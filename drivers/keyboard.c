@@ -17,6 +17,7 @@
 #include <kernel/tty.h>
 #include <kernel/kinput.h>
 #include <kernel/process.h>
+#include <kernel/keymap.h>
 
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
@@ -98,7 +99,11 @@ static void kbd_irq(struct int_frame *f)
     switch (code) {
     case 0x2A: case 0x36: if (!ext) { mods = release ? mods & ~MOD_SHIFT : mods | MOD_SHIFT; return; } break;
     case 0x1D: mods = release ? mods & ~MOD_CTRL : mods | MOD_CTRL; return;
-    case 0x38: mods = release ? mods & ~MOD_ALT  : mods | MOD_ALT;  return;
+    case 0x38: {                                /* E0 38: right Alt, AltGr on most layouts */
+        uint8_t bit = ext && keymap_has_altgr() ? MOD_ALTGR : MOD_ALT;
+        mods = release ? mods & ~bit : mods | bit;
+        return;
+    }
     case 0x3A: if (!release) mods ^= MOD_CAPS; return;
     }
     if (release) return;
@@ -122,6 +127,12 @@ static void kbd_irq(struct int_frame *f)
     }
     if (ext && code == 0x35) { enqueue(KEY_CHAR, '/'); return; }
 
+    if (!ext && keymap_handles(code)) {         /* the main block: the layout's character */
+        char u[4];
+        size_t n = keymap_translate(code, mods, u);
+        for (size_t i = 0; i < n; i++) enqueue(KEY_CHAR, u[i]);
+        return;
+    }
     if (code < sizeof map_normal) {
         bool shift = (mods & MOD_SHIFT) != 0;
         char c = shift ? map_shift[code] : map_normal[code];
