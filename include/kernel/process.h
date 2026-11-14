@@ -138,6 +138,8 @@ int64_t sig_return(void);
 int64_t sig_suspend(uint64_t mask, uint64_t size);
 int64_t sig_pause(void);
 int64_t sig_kill(int64_t pid, int64_t sig);
+bool signal_init(int sig);
+extern bool g_cad_to_init;     /* reboot(CAD_OFF): Ctrl+Alt+Del is SIGINT to init */      /* to init (pid 1) if it is a program; false if not */
 /* ppoll, pselect6, epoll_pwait: wait with this signal mask (0: unchanged).
  * sig_temp_mask_end puts the old one back, unless a signal is about to be
  * delivered under the temporary mask (then rt_sigreturn restores it). */

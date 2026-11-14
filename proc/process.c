@@ -171,9 +171,23 @@ void process_exit(struct tcb *t)
 
     /* The last thread: the process is gone, and wait4() may take its
      * status from here on. */
-    for (int i = 0; i < MAX_TASKS; i++) {               /* orphans: reaped by the kernel */
+    /* Orphans go to init (pid 1) when it is a program, as on Linux, and it
+     * collects them; with the kernel's own init they are reaped by the
+     * kernel. A zombie among them is reported to init at once. */
+    struct tcb *init = t->tgid != 1 ? task_find(1) : NULL;
+    if (!proc_alive(init) || !init->user || init->tgid != 1) init = NULL;
+    bool orphan_zombie = false;
+    for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *c = task_slot(i);
-        if (c->state != TASK_UNUSED && c->pid && c->ppid == t->tgid && !same_group(c, t)) c->ppid = 0;
+        if (c->state != TASK_UNUSED && c->pid && c->ppid == t->tgid && !same_group(c, t)) {
+            c->ppid = init ? 1 : 0;
+            if (init && c->user && is_leader(c) && !proc_alive(c)) orphan_zombie = true;
+        }
+    }
+    if (orphan_zombie) {
+        struct ksig_info zi = { .code = CLD_EXITED };
+        send_info_locked(init, SIGCHLD, &zi);
+        wakeup(init->signal);
     }
     struct tcb *lead = is_leader(t) ? t : task_find(t->tgid);
     if (!lead) { spin_unlock_irqrestore(&proc_lock, f); return; }
@@ -1359,6 +1373,29 @@ static int64_t init_signal(int sig, struct tcb *self)
     }
 }
 
+/* init (pid 1, a program) gets only the signals it handles, as on Linux:
+ * SIGKILL and SIGSTOP never, and nothing whose default would end it. */
+static bool init_ignores(const struct tcb *init, int sig)
+{
+    if (sig == SIGKILL || sig == SIGSTOP) return true;
+    return init->sighand->action[sig - 1].handler == SIG_DFL;
+}
+
+/* The kernel's own signal to init: SIGINT for Ctrl+Alt+Del once init has
+ * asked for it (reboot(CAD_OFF)). False when pid 1 is not a program. */
+bool signal_init(int sig)
+{
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    struct tcb *t = task_find(1);
+    bool ok = proc_alive(t) && t->user && t->tgid == 1;
+    if (ok) {
+        struct ksig_info info = { .code = SI_KERNEL };
+        send_info_locked(t, sig, &info);
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return ok;
+}
+
 int64_t sig_kill(int64_t pid, int64_t sig)
 {
     struct tcb *self = current_task();
@@ -1375,6 +1412,7 @@ int64_t sig_kill(int64_t pid, int64_t sig)
         if (!t || t->state == TASK_UNUSED) r = -ESRCH;
         else if (!t->user) r = -EPERM;                  /* kernel threads */
         else if (!proc_alive(t)) r = 0;                 /* a zombie */
+        else if (t->tgid == 1 && sig && init_ignores(t, (int)sig)) r = 0;
         else r = send_info_locked(t, (int)sig, &info);
         spin_unlock_irqrestore(&proc_lock, fl);
         return r;
@@ -1384,8 +1422,9 @@ int64_t sig_kill(int64_t pid, int64_t sig)
     for (int i = 0; i < MAX_TASKS; i++) {               /* each process once: through its leader */
         struct tcb *t = task_slot(i);
         if (!proc_alive(t) || !t->user || !is_leader(t)) continue;
-        if (pid == -1 ? same_group(t, self) : t->pgid != pgid) continue;
+        if (pid == -1 ? same_group(t, self) || t->tgid == 1 : t->pgid != pgid) continue;   /* -1: not init */
         found = true;
+        if (t->tgid == 1 && sig && init_ignores(t, (int)sig)) continue;
         send_info_locked(t, (int)sig, &info);
     }
     spin_unlock_irqrestore(&proc_lock, fl);

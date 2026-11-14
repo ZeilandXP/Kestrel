@@ -59,7 +59,7 @@ On Fedora and Arch the GRUB tools are called `grub2-*`. The Makefile finds both 
 
 The kernel log goes to COM1, so `make run` prints it in your terminal (`-serial stdio`). Once interrupts are on, the log is queued and the timer tick feeds the UART, so a message never waits for the port: a real UART takes about 7 ms a line at 115200 baud, which kprintf used to spend with interrupts off. When the queue (64 KiB) is full, the port loses text (the kernel log and `REPORT.TXT` keep it) and says how much; a panic sends what is queued first.
 
-**Full desktop images.** With the ports built first (`make xlibre`, `make icewm`, `make busybox`, `make xterm`; see "X11", "IceWM" and "Terminals"), `make usbimg` and `make iso` include them. Both GRUB menus then offer these entries for 5 seconds:
+**Full desktop images.** With the ports built first (`make xlibre`, `make icewm`, `make busybox`, `make sysvinit`, `make xterm`; see "X11", "IceWM", "Terminals" and "SysVinit"), `make usbimg` and `make iso` include them. Both GRUB menus then offer these entries for 5 seconds:
 - **Desktop** (the default): `kestrel.exec=/bin/startx` starts the X server, then LXDE where the root file system has it (the Firefox image, see "glibc programs, GTK and Firefox"), otherwise IceWM and an xterm. Logout in the desktop's menu ends the session, and the screen returns to the text terminals, which stay running underneath.
 - **Text console:** a login shell (`/bin/sh`) on every monitor's terminal, no X. Type `startx` there for the desktop.
 - **Desktop** and **text console, basic display:** the same with `linuxkpi.drm=0`. Linux's DRM drivers (nouveau, bochs) drive the screens by default, the boot screen included (see "Phase 2" under "Linux drivers: the Linux KPI"); the basic display keeps to the firmware's frame buffer, one monitor at the mode GRUB set, as a fallback when a driver misbehaves. The boot manager's Safe Mode does the same.
@@ -100,6 +100,8 @@ Text is the **Kestrel 15** font (`drivers/kfont_15.c`, from `third_party/kestrel
 ## After boot: one terminal and one shell per monitor
 
 Every monitor gets its own text terminal (`kernel/tty.c`), drawn with the Kestrel font for its resolution (below). `init` (pid 1) prints a short system summary on the first monitor, read through system calls. It then starts a shell on every monitor: BusyBox's `/bin/sh` as a login shell on a real Unix terminal (`kernel/vt.c`, see "The shell on the terminals" below). Without `/bin/sh` on the boot volume, or with `kestrel.shell=kush` on the kernel command line, it runs `kush` (`kernel/kush.c`), the shell built into the kernel, instead.
+
+**SysVinit.** When the root file system has `/sbin/init`, as the USB sticks' ext2 root and an installed system do, the kernel makes each monitor's terminal ready and runs SysVinit as pid 1 instead (see "SysVinit" below). Then `/etc/inittab` decides what runs, and a getty on each terminal logs root in. The ISO, whose root is in memory, keeps the kernel's own init. `kestrel.init=builtin` keeps it anywhere, and `init=PATH` (or `kestrel.init=PATH`) runs another program as pid 1.
 
 **Fonts** (`drivers/kfont_10.c`, `drivers/kfont_12.c`, `drivers/kfont_15.c`, `include/kernel/kestrel_font.h`): three sizes of the Kestrel font, 256 glyphs each in Windows-1252 order. Each monitor's terminal takes one by its resolution: **Kestrel 10** (11×15-pixel cells) below 1024×768, so 72 × 40 cells at 800×600; **Kestrel 12** (12×18) from 1024×768, so 85 × 42 cells at 1024×768; and **Kestrel 15** (14×22) from 1920×1080, so 137 × 49 cells at 1920×1080. They are generated from the glyph sheets `third_party/kestrel_font/Kestrel_10.bmp` (16×16-pixel cells), `Kestrel_12.bmp` (13×18) and `Kestrel_15.bmp` (14×22) by `tools/sheet2font.py` (`make fonts`). The tool cuts the box that holds every glyph's ink out of the same place in every cell: pixel for pixel, no scaling, so every glyph keeps its shape and baseline. The box is one pixel wider than the widest ink, so even the widest letters (mm, WW) keep a pixel between them and nothing wider is wasted, and has a one-pixel margin above and below. To change a font, replace its sheet and run `make fonts`.
 
@@ -666,6 +668,7 @@ ports/icewm/                 IceWM build script and Kestrel configuration
 ports/lxpanel/               LXPanel rebuilt from Ubuntu's source with its panel-width patch (LXDE)
 ports/toolchain/             musl-g++ (C++ with libsupc++), pkg-config and CMake wrappers
 ports/busybox/               BusyBox build (/bin/sh and the command-line tools)
+ports/sysvinit/              SysVinit build, inittab and boot scripts (the ext2 root's init)
 ports/xterm/                 xterm build and its musl patch
 rootfs/                      contents of the boot volume payload
 ui/bootmgr.c                 boot manager, F8 screen, tools
@@ -738,7 +741,7 @@ Calls can enter through two paths:
 Every pointer a call receives is checked to lie in the user half and copied through `copy_from_user`/`copy_to_user` (`kernel/uaccess.c`): a bad or unmapped pointer gives `-EFAULT`, never a kernel fault. Structures with pointers inside (`msghdr`, iovecs, `epoll_event`, control messages) are copied into the kernel once and only that copy is used, so another thread cannot change them between the check and the use.
 
 **Implemented** (by area):
-- **Files:** read, write, readv, writev, pread64, pwrite64, open, openat, creat, close, lseek, stat, lstat, fstat, newfstatat, statx, access, faccessat, faccessat2, getdents64, ioctl, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`, `F_ADD_SEALS`/`F_GET_SEALS`, and byte-range locks: `F_GETLK`/`F_SETLK`/`F_SETLKW` and the `F_OFD_*` forms, in `fs/lockf.c`), dup, dup2, dup3, close_range, fadvise64 and readahead (`WILLNEED`: see the page cache), fallocate (`EOPNOTSUPP`, so glibc's `posix_fallocate` writes instead), ftruncate, truncate, fsync, fdatasync, flock (advisory, per open file description), the twelve `*xattr` calls (no file system stores extended attributes: lists are empty, reads give `ENODATA`, writes `ENOTSUP`), sendfile, readlink/readlinkat (symbolic links, `/proc/self/exe` and the links in `/proc/PID/fd`; opening `/proc/self/fd/N` or `/dev/fd/N` opens the same file again with the new access mode, which is how Firefox makes read-only copies of a memfd), preadv, pwritev, copy_file_range, mkdir, mkdirat, rmdir, unlink, unlinkat, rename, chmod, fchmod (accepted), fchmodat2, chown, utimensat, chdir, getcwd, umask.
+- **Files:** read, write, readv, writev, pread64, pwrite64, open, openat, creat, close, lseek, stat, lstat, fstat, newfstatat, statx, access, faccessat, faccessat2, getdents64, ioctl, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`, `F_ADD_SEALS`/`F_GET_SEALS`, and byte-range locks: `F_GETLK`/`F_SETLK`/`F_SETLKW` and the `F_OFD_*` forms, in `fs/lockf.c`), dup, dup2, dup3, close_range, fadvise64 and readahead (`WILLNEED`: see the page cache), fallocate (`EOPNOTSUPP`, so glibc's `posix_fallocate` writes instead), ftruncate, truncate, fsync, fdatasync, flock (advisory, per open file description), the twelve `*xattr` calls (no file system stores extended attributes: lists are empty, reads give `ENODATA`, writes `ENOTSUP`), sendfile, readlink/readlinkat (symbolic links, `/proc/self/exe` and the links in `/proc/PID/fd`; opening `/proc/self/fd/N` or `/dev/fd/N` opens the same file again with the new access mode, which is how Firefox makes read-only copies of a memfd), preadv, pwritev, copy_file_range, mkdir, mkdirat, rmdir, unlink, unlinkat, mknod, mknodat (FIFOs and regular files), rename, chmod, fchmod (accepted), fchmodat2, chown, utimensat, chdir, getcwd, umask.
 - **Mounts:** mount (tmpfs, ramfs, FUSE, `proc`, `sysfs`, `devtmpfs` and `devpts`, which give the one instance again, bind mounts, `MS_MOVE` and remounts), umount2 (`MNT_DETACH`; `MNT_EXPIRE`, which unmounts on the second call when nobody used the mount in between), statfs and fstatfs (Linux's magic numbers for proc, sysfs, tmpfs, devpts, ext2 and FUSE, which glibc and Bionic check). `/proc/mounts` and `/proc/self/mountinfo` name sources, types and parents as Linux does.
 - **Waiting for events:** poll, ppoll, select, pselect6 (with signal masks), epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait, epoll_pwait2, eventfd, eventfd2, timerfd_create, timerfd_settime, timerfd_gettime, signalfd, signalfd4, pipe, pipe2, inotify_init, inotify_init1, inotify_add_watch, inotify_rm_watch (`fs/inotify.c`).
 - **Sockets (`AF_UNIX`):** socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg and recvmsg (with `SCM_RIGHTS`), sendmmsg, recvmmsg, shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes).
@@ -749,7 +752,7 @@ Every pointer a call receives is checked to lie in the user half and copied thro
 - **Identity and limits:** getuid, getgid, geteuid, getegid, setuid, setgid, setreuid, setregid, setresuid, setresgid, getresuid, getresgid, getgroups, setgroups (one uid and gid per process; changing them takes `CAP_SETUID` or `CAP_SETGID`, and in a user namespace the ids are seen through its maps), getrlimit, setrlimit, prlimit64 (fixed limits; 1024 descriptors).
 - **Time and system:** nanosleep, clock_nanosleep (with `TIMER_ABSTIME`), time, clock_gettime and clock_getres (`CLOCK_REALTIME` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the TSC or HPET; also answered in user mode by the vDSO), gettimeofday, times, getrusage, sysinfo, uname, sethostname, setdomainname, getrandom, sync, syncfs, reboot.
 
-**Power:** `poweroff`, `reboot` and `halt` work from any shell (as root). BusyBox asks init with a signal to pid 1, and the kernel plays that part; `reboot(2)` and the `-f` forms go straight to `kernel/power.c`. Power-off uses ACPI S5 (PM1 control ports from the FADT, the `\_S5_` sleep type from the DSDT), so it works on real machines, with the QEMU/Bochs/VirtualBox ports as a fallback. Restart tries the FADT reset register, port `0xCF9`, the keyboard controller, then a triple fault. Storage is flushed and the other CPUs are stopped first.
+**Power:** `poweroff`, `reboot` and `halt` work from any shell (as root). Under SysVinit they are its own: `shutdown` asks init through `/run/initctl` to enter run level 0 or 6, whose scripts end processes, write the disks out and call `reboot(2)`. With the kernel's own init, BusyBox's ask init with a signal to pid 1, and the kernel plays that part. `reboot(2)` and the `-f` forms go straight to `kernel/power.c`. Power-off uses ACPI S5 (PM1 control ports from the FADT, the `\_S5_` sleep type from the DSDT), so it works on real machines, with the QEMU/Bochs/VirtualBox ports as a fallback. Restart tries the FADT reset register, port `0xCF9`, the keyboard controller, then a triple fault. Storage is flushed and the other CPUs are stopped first.
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
@@ -915,7 +918,7 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 - **Test:** `user/ptytest.c` checks all of this in 22 tests.
 
 **A shell** (`ports/busybox`): BusyBox 1.36 provides `/bin/sh` (ash) and about 400 tools in one 1.2 MB static-PIE musl binary. It is the login shell on every text terminal.
-- **Install:** every applet is a hard link to it. The boot volume keeps the links: tarfs supports hard links, and `make usbimg` preserves them. `/boot/bin` is bound on `/bin`, so `/bin/sh` is where scripts expect it.
+- **Install:** every applet is a hard link to it. The boot volume keeps the links: tarfs supports hard and symbolic links, and `make usbimg` preserves them. `/boot/bin` is bound on `/bin`, so `/bin/sh` is where scripts expect it.
 - **Building:** `make busybox BUSYBOX_SRC=<unpacked busybox release>`.
 - **Test:** `user/shtest.sh` (`kestrel.exec=/bin/sh,/bin/shtest.sh`) checks pipes, redirection, background jobs, `kill`, traps, here-documents, `/proc`, `ps` and `killall` in 22 tests.
 - **One exec** of a BusyBox tool takes about 40–80 ms in QEMU; the binary is read from the boot volume each time.
@@ -940,6 +943,30 @@ make usbimg
 **Checked in QEMU** with an xHCI keyboard and mouse: commands typed into the shell run, including pipes, `ps`, `top` and `stty size`; Ctrl+C interrupts a running `sleep`; `exit` closes the window, and IceWM reaps xterm.
 
 **Not yet:** fonts other than `fixed`, job control (Ctrl+Z, `fg`/`bg`), and a writable disk to keep files across reboots; `/tmp` and the root file system are in RAM.
+
+## SysVinit (`ports/sysvinit/`)
+
+SysVinit 3.08 is the init system of Kestrel's ext2 root (the USB sticks, and a system installed from one). It is built as static-PIE musl programs into `/sbin`: `init` (and `telinit`), `halt` (`reboot`, `poweroff`), `shutdown`, `runlevel`, `killall5` (`pidof`) and `wall`. Kestrel's boot scripts and `/etc/inittab` come with it (`ports/sysvinit/root`).
+
+**What runs:**
+- **Boot:** the kernel mounts `/`, `/dev`, `/dev/pts`, `/proc` and `/sys`, brings the network up and makes each monitor's terminal, then starts `/sbin/init` as pid 1 on `/dev/console`. Run level 2 is the default.
+- **`/etc/init.d/rcS`** (the sysinit line) mounts a tmpfs on `/run`, makes `/var/run` and `/var/lock`, mounts `/etc/fstab`'s entries, sets the host name from `/etc/hostname`, and runs `/etc/rcS.d/S*`. It then writes a getty line for each terminal there is (`/dev/tty1`, `/dev/tty2`, ... one per monitor) into `/etc/inittab.d/ttys.tab`, and has init read it.
+- **Terminals:** each getty (BusyBox's, or the distribution's on a distribution's root) runs `/sbin/kestrel-autologin`, which logs root in with no password asked, as the kernel's own init does. Taking `-n -l /sbin/kestrel-autologin` out of the getty lines in `rcS` gives a login prompt instead.
+- **Run levels:** `/etc/init.d/rc N` runs `/etc/rcN.d/K*` with `stop` and `/etc/rcN.d/S*` with `start`. Levels 0 and 6 end every process (`killall5 -15`, then `-9`), write the disks out and power off or restart. Levels 2 to 5 run `/etc/rc.local` if it is there. `S` is single-user (`sulogin`).
+- **Ctrl+Alt+Del:** init turns the kernel's reset off (`reboot(CAD_OFF)`), so the key sends it SIGINT, and its `ctrlaltdel` line restarts the machine cleanly.
+- **Users:** `/etc/passwd`, `/etc/group` and `/etc/shadow` come with it for root and `user` (uid 1000) when the root has none. A distribution's root keeps its own.
+
+**What the kernel does for it:**
+- **pid 1** is kept for init. Kernel threads start at 2.
+- **Orphans** go to init, which collects them, as on Linux. With the kernel's own init they are reaped by the kernel, as before.
+- **Signals:** init gets only the signals it has a handler for (never SIGKILL or SIGSTOP), and `kill(-1)` passes it by.
+- **Named pipes:** `mknod(2)` and `mkfifo` make FIFOs, which init's `/run/initctl` is (`fs/pipe.c`). As on Linux, opening one for reading waits for a writer and opening for writing waits for a reader; `O_NONBLOCK` and `O_RDWR` don't wait. A FIFO lives in memory, also in a disk's directory, so it doesn't outlast a restart.
+- **`/proc/PID/stat`** gives a process's code addresses, which `killall5` and `ps` use to tell processes from kernel threads.
+- If init ends, the kernel's own init takes over with a shell on each terminal.
+
+**Building:** `make sysvinit SYSVINIT_SRC=<unpacked sysvinit release>` (Ubuntu's `sysvinit_3.08.orig.tar.gz`), then `make usbimg`. `tools/release.sh` does both.
+
+**Checked in QEMU:** the stick boots through `rcS` and run level 2 to a root shell on tty1. `runlevel` says `N 2`, `telinit q` makes init read its configuration again, `poweroff` goes through run level 0 and powers QEMU off, and Ctrl+Alt+Del restarts it through run level 6. The tests run under SysVinit as under the kernel's init, and `fstest` covers FIFOs. Run `fstest` after the boot (`kestrel.exec=40s+/boot/bin/fstest`): its free-space count notices the boot scripts' own writes.
 
 ## Multiprocessor support and robustness
 
@@ -1040,7 +1067,7 @@ How it works:
 - **Record locks** (`fs/lockf.c`): `fcntl` read and write locks on byte ranges, POSIX (owned by the process, dropped when it closes any descriptor of the file) and open-file-description (`F_OFD_*`, dropped with the open file). SQLite, and with it Firefox's profile, depends on them.
 
 **Tests:**
-- `fstest` (in `/bin` on the root volume) runs 83 checks:
+- `fstest` (in `/bin` on the root volume) runs 100 checks:
   - files in every block-map class, sparse files, truncation, `O_APPEND`;
   - fast and slow symbolic links, link loops, `O_NOFOLLOW`;
   - hard links, renames of files and directories (and `..`), 400-entry directories;

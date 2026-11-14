@@ -44,7 +44,8 @@ static struct tcb idle_tasks[MAX_CPUS];            /* the APs' idle threads */
 static uint8_t fpu_areas[MAX_TASKS][FPU_AREA_MAX] __attribute__((aligned(64)));
 #define cur          (this_task())           /* writes: this_cpu()->current, irqs off */
 #define need_resched (this_cpu()->need_resched)
-static int next_pid = 1;
+static int next_pid = 2;        /* 1 is init's (task_reserve_init) */
+static struct tcb *init_maker;  /* its next task_create() makes pid 1 */
 static uint32_t zombie_gen;                         /* task_exit: the idle loop reaps */
 static bool running, preempt = true;
 static uint64_t nswitches;
@@ -511,7 +512,8 @@ struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg
             memset(t, 0, sizeof *t);
             set_state(t, TASK_BLOCKED); /* not runnable until fully built */
             t->paused = true;           /* not even by a signal: task_start() */
-            t->pid = t->tgid = next_pid++;
+            if (init_maker && init_maker == cur) { t->pid = t->tgid = 1; init_maker = NULL; }
+            else t->pid = t->tgid = next_pid++;
         }
         spin_unlock_irqrestore(&proc_lock, f);
         if (own) break;
@@ -552,6 +554,18 @@ struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg
     t->bkl_depth = 1;                   /* thread_trampoline takes the lock first */
     kprintf("sched: created pid %d (%s)\n", t->pid, t->name);
     return t;
+}
+
+/* The caller's next task_create() makes pid 1: init, when it is a
+ * program (once). */
+bool task_reserve_init(void)
+{
+    static bool done;
+    uint64_t f = spin_lock_irqsave(&proc_lock);
+    bool ok = !done;
+    if (ok) { done = true; init_maker = current_task(); }
+    spin_unlock_irqrestore(&proc_lock, f);
+    return ok;
 }
 
 void task_start(struct tcb *t)

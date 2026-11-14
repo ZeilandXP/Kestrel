@@ -16,6 +16,7 @@
 #include <kernel/klog.h>
 #include <kernel/tty.h>
 #include <kernel/kinput.h>
+#include <kernel/process.h>
 
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
@@ -70,6 +71,7 @@ static uint16_t nav_key(uint8_t sc)
 
 static void reboot_now(void)
 {
+    if (g_cad_to_init && signal_init(SIGINT)) { kprintf("keyboard: Ctrl+Alt+Del -> SIGINT to init\n"); return; }
     kprintf("keyboard: Ctrl+Alt+Del -> reset\n");
     while (inb(KBD_STATUS) & 0x02) ;
     outb(KBD_CMD, 0xFE);                        /* pulse CPU reset line */

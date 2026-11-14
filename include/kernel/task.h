@@ -201,6 +201,7 @@ bool        sched_preemption(void);
 struct tcb *current_task(void);
 struct tcb *task_create(const char *name, int (*entry)(void *), void *arg);
 struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg);
+bool task_reserve_init(void);   /* the caller's next task_create() is pid 1 (once) */
 void        task_start(struct tcb *t);  /* a paused task: runnable from now on */
 /* The process tree: parent links (ppid), thread counts, a thread taking
  * over its process id, exit statuses and their collection, and the waits

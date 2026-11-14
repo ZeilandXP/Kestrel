@@ -1,0 +1,12 @@
+#!/bin/sh
+# /etc/init.d/sendsigs: before power-off or restart, ask every process to
+# end (SIGTERM), then end what is left (SIGKILL). killall5 spares init,
+# kernel threads and this script's own session.
+case "$1" in
+start)
+    killall5 -15
+    sleep 2
+    killall5 -9
+    ;;
+esac
+exit 0

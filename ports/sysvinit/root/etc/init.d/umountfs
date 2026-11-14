@@ -1,0 +1,9 @@
+#!/bin/sh
+# /etc/init.d/umountfs: write everything out before power-off or restart.
+# The kernel flushes the disks again as it powers off or restarts.
+case "$1" in
+start)
+    sync
+    ;;
+esac
+exit 0

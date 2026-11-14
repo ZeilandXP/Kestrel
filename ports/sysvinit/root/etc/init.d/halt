@@ -1,0 +1,9 @@
+#!/bin/sh
+# /etc/init.d/halt: the last step of run level 0. Powers off (ACPI), or
+# halts with INIT_HALT=HALT (shutdown -H).
+case "$1" in
+start)
+    if [ "$INIT_HALT" = HALT ]; then halt -d -f; else halt -d -f -p; fi
+    ;;
+esac
+exit 0

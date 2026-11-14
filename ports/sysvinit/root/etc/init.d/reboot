@@ -1,0 +1,8 @@
+#!/bin/sh
+# /etc/init.d/reboot: the last step of run level 6
+case "$1" in
+start)
+    reboot -d -f
+    ;;
+esac
+exit 0

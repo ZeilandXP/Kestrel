@@ -100,7 +100,7 @@ struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uin
     if (!vn) return NULL;
     strlcpy(vn->name, name, sizeof vn->name);
     vn->type  = t;
-    vn->mode  = mode | (t == VDIR ? S_IFDIR : t == VCHR ? S_IFCHR : t == VSOCK ? S_IFSOCK : t == VLNK ? S_IFLNK : S_IFREG);
+    vn->mode  = mode | (t == VDIR ? S_IFDIR : t == VCHR ? S_IFCHR : t == VSOCK ? S_IFSOCK : t == VLNK ? S_IFLNK : t == VFIFO ? S_IFIFO : S_IFREG);
     vn->ino   = __atomic_fetch_add(&next_ino, 1, __ATOMIC_RELAXED);
     vn->ops   = ops;
     vn->fs    = fs;
@@ -581,8 +581,30 @@ int vfs_mksock(const char *path, mode_t mode, struct vnode **out)
     struct vnode *s = NULL;
     if (r == 0 && !(s = vfs_node_new(parent->fs, name, VSOCK, mode & 0777, NULL))) r = -ENOMEM;
     if (r == 0) {
+        s->memonly = true;
         vfs_node_add(parent, s);                        /* in memory only, also on a disk */
         *out = s;
+        inotify_event(parent, IN_CREATE, name, 0);
+    }
+    vfs_tree_unlock();
+    return r;
+}
+
+/* A named pipe (FIFO): a node in memory, also on a disk, like a socket's
+ * name; fs/pipe.c makes the pipe when it is opened. */
+int vfs_mkfifo_at(struct vnode *base, const char *path, mode_t mode)
+{
+    struct vnode *parent; char name[VFS_NAME_MAX];
+    int r = walk_locked(base, path, WALK_PARENT, &parent, name, true);
+    if (r == 0 && (!strcmp(name, ".") || !strcmp(name, "..") || entry_named(parent, name))) r = -EEXIST;
+    if (r == 0) r = check_writable_dir(parent);
+    struct vnode *n = NULL;
+    if (r == 0 && !(n = vfs_node_new(parent->fs, name, VFIFO, mode & 07777 & ~umask_of_caller(), &fifo_ops))) r = -ENOMEM;
+    if (r == 0) {
+        struct tcb *t = current_task();
+        if (t) { n->uid = t->uid; n->gid = t->gid; }
+        n->memonly = true;
+        vfs_node_add(parent, n);
         inotify_event(parent, IN_CREATE, name, 0);
     }
     vfs_tree_unlock();
@@ -621,7 +643,7 @@ void vfs_node_drop(struct vnode *dir, struct vnode *child)
 
 static int remove_node(struct vnode *dir, struct vnode *vn)
 {
-    if (dir->ops && dir->ops->remove) {
+    if (dir->ops && dir->ops->remove && !vn->memonly) {
         int r = dir->ops->remove(dir, vn);
         if (r < 0) return r;
     }
@@ -713,7 +735,12 @@ static int rename_locked(struct vnode *obase, const char *from, struct vnode *nb
             if (old->children) return -ENOTEMPTY;
         }
     }
-    if (op->ops && op->ops->rename && (r = op->ops->rename(op, vn, np, nname, old)) < 0) return r;
+    if (!vn->memonly) {                 /* a FIFO or a socket's name is not on the disk */
+        struct vnode *gone = old && !old->memonly ? old : NULL;
+        if (op->ops && op->ops->rename && (r = op->ops->rename(op, vn, np, nname, gone)) < 0) return r;
+    } else if (old && !old->memonly && np->ops && np->ops->remove && (r = np->ops->remove(np, old)) < 0) {
+        return r;
+    }
     if (old) { inotify_event(old, IN_DELETE_SELF, NULL, 0); node_remove(np, old); node_free(old); }
     node_remove(op, vn);
     strlcpy(vn->name, nname, sizeof vn->name);
@@ -1098,7 +1125,7 @@ ssize_t vfs_write(struct file *f, const void *buf, size_t len)
 
 off_t vfs_lseek(struct file *f, off_t off, int whence)
 {
-    if (f->vn->type == VSOCK || (f->vn->type == VCHR && !(f->vn->ops && f->vn->ops->size))) return -ESPIPE;   /* ttys, null... */
+    if (f->vn->type == VSOCK || f->vn->type == VFIFO || (f->vn->type == VCHR && !(f->vn->ops && f->vn->ops->size))) return -ESPIPE;   /* ttys, null... */
     int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->off
                  : whence == SEEK_END ? (int64_t)node_size(f->vn) : -1;
     if (base < 0 || base + off < 0) return -EINVAL;
@@ -1120,6 +1147,7 @@ static uint8_t dtype(struct vnode *vn)
     case VREG:  return DT_REG;
     case VLNK:  return DT_LNK;
     case VSOCK: return DT_SOCK;
+    case VFIFO: return DT_FIFO;
     default:    return DT_UNKNOWN;
     }
 }
@@ -1385,6 +1413,16 @@ static int ramfs_readlink(struct vnode *vn, char *buf, size_t size)
 }
 
 static const struct vnode_ops ramfs_link_ops = { .readlink = ramfs_readlink, .nolock = true };   /* fixed text */
+
+/* A symbolic link held in memory, for a file system built at boot (tarfs) */
+struct vnode *vfs_symlink_node_new(struct mount *fs, const char *name, const char *target)
+{
+    struct vnode *vn = vfs_node_new(fs, name, VLNK, 0777, &ramfs_link_ops);
+    if (!vn) return NULL;
+    if (!(vn->data = kstrdup(target))) { kfree(vn); return NULL; }
+    vn->size = strlen(target);
+    return vn;
+}
 
 struct vnode *vfs_node_floating(struct mount *fs, const char *name, enum vtype t, uint32_t mode)
 {

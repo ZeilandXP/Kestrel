@@ -314,9 +314,54 @@ static int exec_launcher(void *arg)
     return 0;
 }
 
+/* init as a program: init=PATH or kestrel.init=PATH on the command line,
+ * else /sbin/init (SysVinit, on the root volumes that carry it).
+ * kestrel.init=builtin keeps the kernel's own (the shells below). */
+static bool user_init(char *path, size_t cap)
+{
+    const char *keys[] = { "kestrel.init=", "init=" };
+    path[0] = 0;
+    for (int k = 0; k < 2 && !path[0]; k++) {
+        size_t kl = strlen(keys[k]);
+        for (const char *s = g_boot.cmdline; *s; s++)
+            if ((s == g_boot.cmdline || s[-1] == ' ') && !strncmp(s, keys[k], kl)) {
+                s += kl;
+                size_t n = 0;
+                while (s[n] && s[n] != ' ' && n + 1 < cap) { path[n] = s[n]; n++; }
+                path[n] = 0;
+                break;
+            }
+    }
+    if (!strcmp(path, "builtin")) return false;
+    if (!path[0]) strlcpy(path, "/sbin/init", cap);
+    struct stat st;
+    if (vfs_stat(path, &st) < 0 || (st.st_mode & S_IFMT) != S_IFREG || !(st.st_mode & 0111)) return false;
+    return true;
+}
+
+/* Run it as pid 1, with every monitor's terminal ready for its getty lines.
+ * Returns if it cannot start or when it ends (it should not): the kernel's
+ * own init takes over then. */
+static void run_user_init(const char *path)
+{
+    for (int i = 0; i < tty_count; i++) vt_start(i);
+    strlcpy(current_task()->name, "kinit", sizeof current_task()->name);   /* pidof init: only pid 1 */
+    char *argv[] = { "init" };
+    kprintf("init: starting %s as pid 1\n", path);
+    if (!(g_boot.boot_flags & BOOTOPT_DEBUG)) klog_set_console(false);
+    int pid = exec_spawn_init(path, 1, argv);
+    if (pid < 0) { kprintf("init: %s: cannot start (%d)\n", path, pid); return; }
+    int depth = bkl_release_all();          /* waiting is the process tree's (proc_lock) */
+    int st = exec_wait(pid);
+    bkl_reacquire(depth);
+    kprintf("init: %s ended (status %d); the kernel's shells take over\n", path, st);
+}
+
 static int init_main(void *arg)
 {
     (void)arg;
+    char ipath[128];
+    if (user_init(ipath, sizeof ipath)) run_user_init(ipath);
     /* stdin, stdout, stderr -> the console tty */
     u_open("/dev/tty", O_RDONLY, 0);
     u_open("/dev/tty", O_WRONLY, 0);

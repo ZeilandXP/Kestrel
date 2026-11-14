@@ -209,7 +209,7 @@ KERNEL_CMDLINE ?=
 ROOTFS_BASE ?=
 ROOTDISK    := $(BUILD)/rootdisk.ext2
 
-.PHONY: FORCE lkpi-drm-check lkpi-nv-check lkpi-nv-cflags xlibre icewm busybox xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts images clean distclean
+.PHONY: FORCE lkpi-drm-check lkpi-nv-check lkpi-nv-cflags xlibre icewm busybox sysvinit xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts images clean distclean
 
 all: $(KERNEL)
 
@@ -448,6 +448,15 @@ busybox:
 	@test -n "$(BUSYBOX_SRC)" || { echo "usage: make busybox BUSYBOX_SRC=<unpacked busybox release>"; exit 1; }
 	@ports/busybox/build.sh $(BUSYBOX_SRC) $(BUILD)
 
+# SysVinit (ports/sysvinit): /sbin/init and its tools, with Kestrel's
+# /etc/inittab and boot scripts; the kernel runs /sbin/init as pid 1:
+#   make sysvinit SYSVINIT_SRC=<unpacked sysvinit release>
+SYSVINIT_SRC  ?=
+SYSVINIT_ROOT := $(BUILD)/sysvinit-root
+sysvinit:
+	@test -n "$(SYSVINIT_SRC)" || { echo "usage: make sysvinit SYSVINIT_SRC=<unpacked sysvinit release>"; exit 1; }
+	@ports/sysvinit/build.sh $(SYSVINIT_SRC) $(BUILD)
+
 # xterm (ports/xterm), after the X libraries:
 #   make xterm XTERM_SRC=<unpacked xterm release>
 XTERM_SRC  ?=
@@ -473,7 +482,7 @@ $(BUILD)/nvfw.stamp: FORCE
 	@mkdir -p $(BUILD)
 	@echo '$(abspath $(NVIDIA_FW))' | cmp -s - $@ || echo '$(abspath $(NVIDIA_FW))' > $@
 
-$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp) \
+$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp) $(wildcard $(SYSVINIT_ROOT)/.stamp) \
                        $(BUILD)/nvfw.stamp $(NVIDIA_FW) tools/nvfirmware.py
 	@rm -rf $(ROOTFS_STAGE)
 	@mkdir -p $(ROOTFS_STAGE)/bin
@@ -488,6 +497,7 @@ $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) u
 	@if [ -f $(ICEWM_ROOT)/.stamp ]; then cp -r $(ICEWM_ROOT)/bin $(ICEWM_ROOT)/share $(ICEWM_ROOT)/etc $(ROOTFS_STAGE)/; fi
 	@if [ -f $(BUSYBOX_ROOT)/.stamp ]; then cp -a $(BUSYBOX_ROOT)/bin $(ROOTFS_STAGE)/; fi   # -a: keep the hard links
 	@if [ -f $(XTERM_ROOT)/.stamp ]; then cp -r $(XTERM_ROOT)/bin $(XTERM_ROOT)/share $(ROOTFS_STAGE)/; fi
+	@if [ -f $(SYSVINIT_ROOT)/.stamp ]; then cp -a $(SYSVINIT_ROOT)/sbin $(SYSVINIT_ROOT)/etc $(SYSVINIT_ROOT)/run $(ROOTFS_STAGE)/; fi
 	@if [ -n "$(NVIDIA_FW)" ]; then $(PYTHON) tools/nvfirmware.py $(NVIDIA_FW) $(ROOTFS_STAGE); fi
 	@touch $@
 

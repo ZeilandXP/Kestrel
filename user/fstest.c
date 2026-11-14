@@ -127,6 +127,7 @@ static const char *in(const char *dir, const char *name) { snprintf(P, sizeof P,
 
 static void inotify_checks(const char *dir);
 static void lock_checks(const char *dir);
+static void fifo_checks(const char *dir);
 
 static void checks(const char *dir)
 {
@@ -287,12 +288,69 @@ static void checks(const char *dir)
     printf("record locks, descriptor reopen, waitid:\n");
     lock_checks(dir);
 
+    printf("named pipes (FIFOs):\n");
+    fifo_checks(dir);
+
     printf("space accounting:\n");
     rm_rf(dir);
     CHECK(access(dir, F_OK) < 0, "rm -r of the whole tree (deleting while reading directories)");
     long free1 = free_blocks("/");
     CHECK(free0 >= 0 && free1 == free0 + 1, "after removing everything, the free count is back (all blocks freed)");
     if (free1 != free0 + 1) printf("  (free before %ld, after %ld; the test directory's own block accounts for 1)\n", free0, free1);
+}
+
+/* FIFOs, as SysVinit's /run/initctl and shells' process substitution use them */
+static void fifo_checks(const char *dir)
+{
+    char f[512], g[512];
+    snprintf(f, sizeof f, "%s/fifo", dir);
+    snprintf(g, sizeof g, "%s/fifo2", dir);
+    struct stat st;
+    CHECK(mkfifo(f, 0600) == 0, "mkfifo");
+    CHECK(stat(f, &st) == 0 && S_ISFIFO(st.st_mode) && (st.st_mode & 0777) == 0600 && st.st_size == 0, "stat: S_IFIFO, its mode");
+    errno = 0;
+    CHECK(mkfifo(f, 0600) < 0 && errno == EEXIST, "mkfifo again: EEXIST");
+    errno = 0;
+    CHECK(open(f, O_WRONLY | O_NONBLOCK) < 0 && errno == ENXIO, "O_WRONLY|O_NONBLOCK with no reader: ENXIO");
+    int r = open(f, O_RDONLY | O_NONBLOCK);
+    CHECK(r >= 0, "O_RDONLY|O_NONBLOCK: does not wait");
+    char b[16];
+    errno = 0;
+    CHECK(read(r, b, sizeof b) == 0, "read with no writer yet: 0");
+    int w = open(f, O_WRONLY | O_NONBLOCK);
+    CHECK(w >= 0 && write(w, "abc", 3) == 3, "a writer, now that there is a reader");
+    struct pollfd pf = { r, POLLIN, 0 };
+    CHECK(poll(&pf, 1, 1000) == 1 && (pf.revents & POLLIN), "poll: readable");
+    CHECK(read(r, b, sizeof b) == 3 && !memcmp(b, "abc", 3), "the reader gets it");
+    errno = 0;
+    CHECK(lseek(w, 0, SEEK_SET) < 0 && errno == ESPIPE, "lseek: ESPIPE");
+    close(w);
+    pf.revents = 0;
+    CHECK(poll(&pf, 1, 0) == 1 && (pf.revents & POLLHUP), "the writer gone: POLLHUP");
+    close(r);
+    int rw = open(f, O_RDWR);
+    CHECK(rw >= 0 && write(rw, "x", 1) == 1 && read(rw, b, 1) == 1 && b[0] == 'x', "O_RDWR: both ends, no wait");
+    close(rw);
+    /* blocking opens meet: a child writes, the parent reads */
+    pid_t c = fork();
+    if (c == 0) {
+        int fd = open(f, O_WRONLY);
+        _exit(fd >= 0 && write(fd, "hello", 5) == 5 ? 0 : 1);
+    }
+    int fd = open(f, O_RDONLY);
+    ssize_t n = fd >= 0 ? read(fd, b, sizeof b) : -1;
+    int stc = -1;
+    waitpid(c, &stc, 0);
+    CHECK(n == 5 && !memcmp(b, "hello", 5) && WIFEXITED(stc) && WEXITSTATUS(stc) == 0, "blocking open for reading meets a writer's");
+    if (fd >= 0) close(fd);
+    DIR *d = opendir(dir);
+    int dt = -1;
+    for (struct dirent *e; d && (e = readdir(d)); ) if (!strcmp(e->d_name, "fifo")) dt = e->d_type;
+    if (d) closedir(d);
+    CHECK(dt == DT_FIFO, "readdir: DT_FIFO");
+    CHECK(rename(f, g) == 0 && stat(g, &st) == 0 && S_ISFIFO(st.st_mode), "rename");
+    CHECK(unlink(g) == 0 && stat(g, &st) < 0, "unlink");
+    CHECK(mknod(f, S_IFREG | 0600, 0) == 0 && stat(f, &st) == 0 && S_ISREG(st.st_mode) && unlink(f) == 0, "mknod of a regular file");
 }
 
 /* inotify: read what is queued into "MASK:name" words, e.g. "100:f 2:f 8:f" */
