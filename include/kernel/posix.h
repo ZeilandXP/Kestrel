@@ -36,6 +36,9 @@ typedef uint32_t gid_t;
 #define EINVAL       22
 #define EMFILE       24
 #define ENOTTY       25
+#ifndef ENOTBLK
+#define ENOTBLK      15
+#endif
 #define ENOSPC       28
 #define EFBIG        27
 #define ESPIPE       29
@@ -141,6 +144,7 @@ struct stat {
 /* ---- getdents64(2) record ----------------------------------------------------- */
 #define DT_UNKNOWN 0
 #define DT_CHR     2
+#define DT_BLK     6
 #define DT_DIR     4
 #define DT_REG     8
 #define DT_LNK     10

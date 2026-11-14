@@ -21,6 +21,7 @@ enum keycode {
 #define MOD_CTRL  0x02
 #define MOD_ALT   0x04
 #define MOD_CAPS  0x08
+#define MOD_ALTGR 0x10      /* right Alt on a layout with an AltGr level */
 
 struct key_event {
     uint16_t key;       /* enum keycode                         */

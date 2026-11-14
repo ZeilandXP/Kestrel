@@ -18,7 +18,7 @@
 #include <kernel/lockcheck.h>
 
 #define BLK_NAME_MAX    16
-#define BLK_MAX         48
+#define BLK_MAX         96              /* partitions replaced by a new table keep their slot */
 
 enum blk_kind { BLK_DISK_SATA, BLK_DISK_USB, BLK_DISK_NVME, BLK_DISK_RAM, BLK_DISK_VIRTIO, BLK_PART };
 
@@ -58,6 +58,7 @@ struct blkdev {
     volatile bool io_busy;                  /* one request at a time per disk  */
     LOCKCHECK_TAG                           /* io_busy, for the lock-order checker */
     bool      partitions_scanned;
+    int       users;                        /* mounted file systems, the boot volume: no writes from programs */
     uint32_t  errors;
     int       last_error;
     uint64_t  rd_n, rd_bytes, wr_n, wr_bytes, busy_cyc;    /* disks: requests served (kstat.h) */
@@ -68,6 +69,7 @@ struct blkdev *blk_register_disk(const char *prefix, enum blk_kind kind, const c
                                  uint32_t block_size, uint64_t blocks,
                                  const struct blkdev_ops *ops, void *ctx);
 int  blk_scan_partitions(struct blkdev *disk);      /* number found, or -errno */
+int  blk_rescan(struct blkdev *disk);               /* new table: drop the old partitions, scan again */
 void blk_mark_removed(struct blkdev *disk);         /* disk and its partitions */
 void blk_publish(void);                             /* create missing /dev nodes */
 void ramdisk_init(uintptr_t mbi);                   /* Multiboot2 modules -> ramN (kernel/ramdisk.c) */
@@ -79,11 +81,19 @@ struct blkdev *blk_disk_of(struct blkdev *b);       /* partition -> its disk */
 
 int  blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf);
 int  blk_read_bytes(struct blkdev *b, uint64_t offset, void *buf, size_t len);
-/* Raw block writes (kernel use only; /dev nodes stay read-only). -EROFS if
- * the driver cannot write. blk_flush() asks the device to commit its cache. */
+/* Raw block writes from the kernel; programs write through /dev/<name> (root
+ * and the disk group), never to a device in use. -EROFS if the driver cannot write. blk_flush() asks the device to commit its cache. */
 int  blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf);
 int  blk_flush(struct blkdev *b);
 uint64_t blk_size_bytes(const struct blkdev *b);
+
+/* In use (a mounted file system, the boot volume): programs may not write
+ * to it, to a disk holding it, or to a disk range overlapping it. */
+void blk_claim(struct blkdev *b);
+void blk_unclaim(struct blkdev *b);
+bool blk_in_use(struct blkdev *b);
+struct vnode;
+struct blkdev *blk_of_node(struct vnode *vn);       /* /dev/<name> -> device, or NULL */
 
 const char *blk_strerror(int err);
 void blk_guid_str(const uint8_t g[16], char out[37]);   /* GPT mixed-endian text */

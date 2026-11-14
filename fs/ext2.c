@@ -1400,6 +1400,20 @@ static int e2_statfs(struct mount *m, struct kstatfs *st)
     return 0;
 }
 
+/* umount(2): written out and marked clean; the device is free again. Nodes
+ * still open (a lazy unmount) can still be read, no longer written. */
+static void e2_umount(struct mount *m)
+{
+    struct e2fs *fs = m->priv;
+    e2_sync(m, true);
+    for (int i = 0; i < 8; i++) if (volumes[i] == fs) volumes[i] = NULL;
+    kmutex_lock(&fs->lock);
+    fs->rdonly = true;
+    kmutex_unlock(&fs->lock);
+    blk_unclaim(fs->dev);
+    kprintf("ext2: %s: unmounted, clean\n", fs->dev->name);
+}
+
 static int flusher(void *arg)
 {
     (void)arg;
@@ -1494,6 +1508,7 @@ int ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out)
     m->priv = fs;
     m->sync = e2_sync;
     m->statfs = e2_statfs;
+    m->umount = e2_umount;
     fs->mnt = m;
     struct e2ino *re = iget(fs, EXT2_ROOT_INO);
     if (!re || (g16(re->raw + I_MODE) & S_IFMT) != S_IFDIR) { kprintf("ext2: %s: no root directory\n", dev->name); goto fail; }
@@ -1507,6 +1522,7 @@ int ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out)
         fs->sb_dirty = true;
         flush_all(fs);
     }
+    blk_claim(dev);                                     /* programs may no longer write to it */
     static bool flusher_started;
     for (int i = 0; i < 8; i++) if (!volumes[i]) { volumes[i] = fs; break; }
     if (!fs->rdonly && !flusher_started) flusher_started = task_create("ext2-flush", flusher, NULL) != NULL;

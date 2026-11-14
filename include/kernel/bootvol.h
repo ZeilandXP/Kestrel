@@ -22,12 +22,19 @@
  *                       rootwait for it, else recovery. A virtio disk
  *                       counts too: in a virtual machine that is where
  *                       the stick image goes. With none by then, the
- *                       other disks are searched once: a stick copied
- *                       onto a SATA/NVMe disk (/dev/install) boots so
+ *                       other disks are searched once (a stick's
+ *                       volume copied onto another disk boots so)
  *   kestrel.root=any    same, any disk (USB, SATA, NVMe or virtio)
  *   kestrel.root=none   skip discovery
  *   kestrel.rootwait=MS settle/wait budget (default 3000, max 60000)
  *   kestrel.uuid=UUID   accept only the volume with this UUID
+ *   kestrel.esp=PARTUUID  GRUB's partition (probe --part-uuid): look on that
+ *                       disk first, so that a stick and an installed copy
+ *                       each boot their own volume and root
+ *
+ * An installed system's 0x4B partition holds two volume slots, at its
+ * first block and at its middle: the updater writes a new release into the
+ * slot not in use, and kestrel.uuid (from GRUB's local.cfg) picks it.
  *   kestrel.rootverify=0  skip the payload CRC check
  */
 #ifndef KESTREL_BOOTVOL_H
@@ -44,6 +51,7 @@
 #define KESTREL_GPT_TYPE        "KESTREL-BOOT-VOL"  /* 16 bytes, raw    */
 #define KESTREL_VOL_VERSION     1
 #define KESTREL_FLAG_USTAR      0x1
+#define KESTREL_SLOT_MIN_BLOCKS 2048                /* 1 MiB: smaller partitions have one slot */
 
 struct kestrel_volhdr {
     char     magic[12];             /* "KESTREL_BOOT"                              */

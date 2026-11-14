@@ -6,6 +6,24 @@
 # (ports/xorg), else Xkestrel; KESTREL_X=xkestrel picks Xkestrel anyway.
 # Logout in the desktop's menu ends the session; the X server stops too
 # and the monitors return to their text terminals.
+#
+# On an installed system (/etc/default/kestrel, written by kestrel-install)
+# the X server runs as root and the desktop as the system's user: logged in
+# by itself with AUTOLOGIN=yes, else after a login in a window on the
+# screen (login -p, then /bin/kestrel-session from /etc/profile); logging
+# out shows that login again. /bin/startx --session runs the desktop alone,
+# for a user on an X server that is already up.
+if [ "${1:-}" = --session ]; then
+    export DISPLAY=${DISPLAY:-:0}
+    export NO_AT_BRIDGE=1
+    export FREETYPE_PROPERTIES=${FREETYPE_PROPERTIES:-truetype:interpreter-version=35}
+    export XDG_RUNTIME_DIR=/tmp/runtime-$(id -u)
+    mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+    cd "${HOME:-/}" 2>/dev/null
+    if command -v startlxde >/dev/null 2>&1; then exec startlxde; fi
+    xterm &
+    exec icewm
+fi
 export DISPLAY=:0
 export NO_AT_BRIDGE=1                  # no accessibility bus: GTK programs would warn
 # FreeType's classic TrueType interpreter (35) for every program on the desktop
@@ -30,6 +48,11 @@ fi
 xpid=$!
 i=0
 while [ ! -S /tmp/.X11-unix/X0 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+# the keyboard layout chosen in the installer (/etc/default/keyboard)
+if [ -r /etc/default/keyboard ] && command -v setxkbmap >/dev/null 2>&1; then
+    XKBLAYOUT=$(sed -n 's/^XKBLAYOUT="*\([^"]*\)"*$/\1/p' /etc/default/keyboard)
+    [ -n "$XKBLAYOUT" ] && setxkbmap "$XKBLAYOUT" 2>/dev/null
+fi
 if command -v startlxde >/dev/null 2>&1; then
     # LXDE's Shutdown and Reboot ask systemd-logind on the system bus:
     # kestrel-logind answers in its place (the Firefox image's root has both)
@@ -41,6 +64,21 @@ if command -v startlxde >/dev/null 2>&1; then
         dbus-daemon --config-file=/etc/dbus-1/kestrel-system.conf --fork --nopidfile
         /usr/libexec/kestrel-logind &
     fi
+fi
+AUTOLOGIN=yes
+AUTOLOGIN_USER=
+[ -r /etc/default/kestrel ] && . /etc/default/kestrel
+if [ "$(id -u)" = 0 ] && [ -n "$AUTOLOGIN_USER" ] && id "$AUTOLOGIN_USER" >/dev/null 2>&1; then
+    if [ "$AUTOLOGIN" = no ]; then
+        # the login in a window, as many times as people log out
+        while kill -0 $xpid 2>/dev/null; do
+            KESTREL_SESSION=1 xterm -fullscreen -T "Log in to Kestrel" -e login -p
+            sleep 1
+        done
+    else
+        su -l "$AUTOLOGIN_USER" -c "DISPLAY=$DISPLAY exec /bin/startx --session"
+    fi
+elif command -v startlxde >/dev/null 2>&1; then
     startlxde
 else
     xterm &
