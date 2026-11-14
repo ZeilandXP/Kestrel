@@ -68,6 +68,8 @@ On the ISO, GRUB loads the boot volume into memory as a Multiboot2 module (`modu
 
 ## Boot manager
 
+**Boot trace.** From the kernel's first lines until the boot manager, every log line is also drawn on the firmware's frame buffer (`klog_trace_screen()`), and the stick's GRUB entries say when they load and start the kernel. A PC that stops early shows where in a photo, without a serial port or a report.
+
 | Key | Action |
 |---|---|
 | ↑ / ↓, Home / End | Slide the silver highlight bar (6-frame eased animation) |
@@ -427,7 +429,7 @@ The path from "the firmware owns the USB controllers" to "the boot volume is mou
 - **Intel PCH xHCI** (7/8/9 series): `USB3_PSSEN`/`XUSB2PR` are written from their BIOS-provided mask registers, so shared ports switch to the xHCI.
 - **xHCI USBLEGSUP:** requested right before the controller reset, with the same wait-then-force logic. The outcome appears in the diagnostic trace.
 
-**2. Calibrated clock** (`kernel/time.c`). The HPET is found through ACPI (RSDP from the Multiboot2 tags, else the EBDA/BIOS area), and the TSC is calibrated against PIT channel 2 by polling. An invariant TSC (CPUID `0x80000007`, every recent PC) becomes the clock, recalibrated against the HPET: it is read in a few cycles, by the vDSO too. Without one the HPET is the clock, and without an HPET the TSC as it is. `kestrel.clocksource=hpet` or `=tsc` overrides the choice. Each CPU that starts takes turns with the boot CPU reading the TSC under a lock; if either ever sees it go backwards, the counters are not in step and the clock goes back to the HPET. Every source works with interrupts off, so settling and transfer timeouts are real milliseconds from the first instruction on.
+**2. Calibrated clock** (`kernel/time.c`). The HPET is found through ACPI (RSDP from the Multiboot2 tags, else the EBDA/BIOS area), and the TSC's rate is measured against the HPET, else the ACPI PM timer, else PIT channel 2, all by polling, else read from CPUID `0x15`/`0x16`. Many UEFI PCs stop the PIT's clock when no legacy BIOS is loaded, and a timer that does not count (a rate outside 100 MHz to 20 GHz) is passed over within seconds instead of holding up the boot. An invariant TSC (CPUID `0x80000007`, every recent PC) becomes the clock: it is read in a few cycles, by the vDSO too. Without one the HPET is the clock, and without an HPET the TSC as it is. `kestrel.clocksource=hpet` or `=tsc` overrides the choice. Each CPU that starts takes turns with the boot CPU reading the TSC under a lock; if either ever sees it go backwards, the counters are not in step and the clock goes back to the HPET. Every source works with interrupts off, so settling and transfer timeouts are real milliseconds from the first instruction on.
 
 **3. Non-blocking settling** (`xhci_settle_step()`). One call is one pass over every root port's `PORTSC`; it never depends on Port Status Change events alone.
 - A new connection is debounced for 100 ms, then enumerated.
@@ -515,12 +517,22 @@ Tested in QEMU (q35, `qemu-xhci`, `usb-storage`) for each of these situations:
 | ISO + data stick under OVMF | mounted (`auto`) |
 | Option-B-only stick | mounted via the sector-0 signature |
 | Stick hot-added 3 s into `rootwait` | found at 3.9 s |
-| No stick with `kestrel.root=usb` | recovery after the budget; commands typed on the USB keyboard and over COM1; `continue` boots on |
+| No stick with `kestrel.root=usb` | the other disks are searched once, then recovery; commands typed on the USB keyboard and over COM1; `continue` boots on |
 | Corrupted payload | CRC mismatch on both candidates → recovery |
 | `blkdebug`-injected read errors | 4 retries per candidate with sense data → recovery |
 | Unplug after boot | removal detected; reads return *device removed*; the replugged stick appears as `usb1` with partitions, through the `usbd` thread |
 | EHCI with three UHCI companions (pc machine) | handoff logged |
 | Floppy and q35/AHCI | boots without regressions |
+
+### Installing onto a disk (alpha)
+
+`/boot/bin/kestrel-install` (run as root, best from the text console) copies the stick onto a SATA or NVMe disk of the PC. **Everything on that disk is erased.** It lists the disks that can take the copy, asks for the disk's name and then for the name again with "yes", and shows the progress. The copy itself is done by the kernel (`kernel/installer.c`, `/dev/install`): it syncs the root file system, zeroes the disk's last 33 sectors (an old backup GPT), then copies the stick from sector 0 to the end of its last partition (GRUB, the boot volume, the ext2 root, the EFI System Partition, the report volume) in 256 KiB requests, and flushes the disk.
+
+The copy boots like the stick, by BIOS and by UEFI: `kestrel.root=usb` searches the other disks once when no stick has appeared within `rootwait`, which adds about 3 s to each boot from the disk. The ext2 root on the boot volume's own disk is preferred, so a stick plugged into a PC with Kestrel installed still uses its own root.
+
+Alpha limits: only whole disks (no dual boot), 512-byte sectors, MBR sticks; the installed root keeps the stick's size; the disk with the mounted root and the stick itself are refused. Writing `install <disk>` to `/dev/install` starts a copy; reading it gives `state`, `source`, `progress` (MiB), `error` and one `disk` line per disk that can take the copy.
+
+Tested in QEMU (q35): installed from the stick onto a blank SATA disk, then booted that disk alone to the LXDE desktop under SeaBIOS and under OVMF; with the stick plugged in as well, the stick boots and keeps its own root.
 
 ## Source layout
 
@@ -619,6 +631,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               stopscreen.c   the red 800x600 panic screen (Kestrel 10), VBE mode switch on BIOS
               vbe_emu.c      VBE calls into the video BIOS through the x86emu emulator (no real mode)
               report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume, /dev/report
+              installer.c    /dev/install: copies the stick onto a SATA/NVMe disk (alpha)
               gpu.c          PCI -> NVIDIA probe glue, 'gpu' command, report section
               display.c      display heads: the boot frame buffer, then the drivers' monitors
               tty.c          one terminal per monitor: draw_char/scroll_screen per TTY, cell
@@ -637,7 +650,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               msi.c          MSI/MSI-X: vectors 0x50-0x6F for PCI devices, /proc/interrupts lines
               usbhost.c      PCI -> xHCI glue, key injection, mouse position, usbd thread, /proc/usb,
                              firmware handoff, mass storage -> block devices
-              time.c         invariant TSC / HPET (ACPI) / PIT-calibrated TSC clock usable before interrupts
+              time.c         invariant TSC / HPET (ACPI) / calibrated TSC clock usable before interrupts
               vdso.c         the vDSO's pages, mapped into every process (clock reads without syscalls)
               kstat.c        performance counters: /proc/kstat, /proc/PID/kstat, a REPORT.TXT section
               block.c        block device registry, MBR/GPT partitions, /proc/partitions
