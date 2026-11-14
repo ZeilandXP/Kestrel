@@ -8,6 +8,7 @@
 #include "msock.h"
 #include "sock.h"
 #include <kernel/socket.h>
+#include <kernel/ns.h>
 #include <kernel/task.h>
 #include <kernel/process.h>
 #include <kernel/string.h>
@@ -61,7 +62,7 @@ int xsock_create(int domain, int type, int protocol, struct file **out)
         if (protocol != NETLINK_ROUTE) return -EPROTONOSUPPORT;
     } else if (domain == AF_PACKET) {
         if (type != SOCK_RAW && type != SOCK_DGRAM) return -ESOCKTNOSUPPORT;
-        if (current_task()->uid != 0) return -EPERM;
+        if (!capable(CAP_NET_RAW)) return -EPERM;
     } else return -EAFNOSUPPORT;
     struct msock *s = kzalloc(sizeof *s);
     if (!s) return -ENOMEM;

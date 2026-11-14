@@ -30,6 +30,7 @@
 #include <kernel/spinlock.h>
 #include <kernel/fpu.h>
 #include <kernel/seccomp.h>
+#include <kernel/ns.h>
 
 extern void context_switch(uint64_t *save_rsp, uint64_t load_rsp, int *saved);
 extern void thread_trampoline(void);
@@ -208,10 +209,18 @@ struct fs_struct *fs_new(struct vnode *cwd, uint32_t umask)
     return f;
 }
 
+struct fs_struct *fs_copy(struct fs_struct *from)
+{
+    struct fs_struct *f = fs_new(vfs_cwd_get(from), from->umask);
+    if (f) f->root = vfs_root_get(from);
+    return f;
+}
+
 void fs_put(struct fs_struct *f)
 {
     if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
     vfs_vnode_put(f->cwd);
+    vfs_vnode_put(f->root);
     kfree(f);
 }
 
@@ -355,6 +364,7 @@ static void reap_one(struct tcb *t)
     sighand_put(sh);
     signal_put(g);
     seccomp_release(t);
+    ns_release(t);
     if (mm) mm_put(mm);                                 /* normally gone at exit already */
     t->pml4 = 0;
     kstack_free(t->kstack);

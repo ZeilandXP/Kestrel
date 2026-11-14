@@ -50,6 +50,9 @@ struct vnode_ops {
     /* fwrite gets each write(2) and writev(2) whole, in one call, however
      * large (up to 1 MiB): a FUSE answer is one message. */
     bool    whole_writes;
+    /* writes reach it although its file system is mounted read-only
+     * (/proc/PID/uid_map) */
+    bool    write_on_rdonly;
     void    (*release)(struct file *f);            /* last close of f      */
     int     (*fioctl)(struct file *f, unsigned long req, void *arg);  /* preferred over ioctl */
     /* Optional: create the open file (devices that hand out a new object per
@@ -251,6 +254,8 @@ void    vfs_vnode_get(struct vnode *vn);        /* NULL is fine */
 void    vfs_vnode_put(struct vnode *vn);        /* frees an unlinked node with its last reference */
 struct vnode *vfs_cwd_get(struct fs_struct *fs);   /* fs's working directory (root if none), referenced */
 void    vfs_set_cwd(struct vnode *vn);          /* the calling task's; takes its own reference */
+struct vnode *vfs_root_get(struct fs_struct *fs);  /* chroot()'s root, referenced; NULL: the real one */
+void    vfs_set_root(struct vnode *vn);         /* chroot(): the calling task's "/" */
 
 /* ---- path operations ------------------------------------------------------
  * Relative paths start at `base` (a directory, the *at calls' dirfd), or the
@@ -356,6 +361,10 @@ struct vnode *pseudo_dir(struct vnode *parent, const char *name);
 struct vnode *pseudo_file(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx);
 struct vnode *pseudo_file_locked(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx);   /* gen needs the big lock */
 struct vnode *ramfs_write_file(const char *path, const char *text);
+/* A node in no directory, freed with its last reference (the caller holds
+ * one): /proc/PID/ns targets */
+struct vnode *vfs_node_floating(struct mount *fs, const char *name, enum vtype t, uint32_t mode);
+void procfs_ns_gone(uint64_t ino);              /* a namespace went: its /proc/PID/ns node goes */
 struct file  *ramfs_anon_file(const char *name, int flags);    /* memfd_create */
 
 /* fs/epoll.c */

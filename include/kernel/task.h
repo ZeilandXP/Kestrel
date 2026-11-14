@@ -62,9 +62,10 @@ struct files_struct {               /* CLONE_FILES: the descriptor table     */
     uint8_t      cloexec[MAX_FDS];
 };
 
-struct fs_struct {                  /* CLONE_FS: working directory, umask    */
+struct fs_struct {                  /* CLONE_FS: working directory, root, umask */
     int           refs;
     struct vnode *cwd;
+    struct vnode *root;             /* chroot(); NULL: the real root           */
     uint32_t      umask;
 };
 
@@ -129,6 +130,11 @@ struct tcb {
     uint8_t   seccomp_mode;     /* seccomp.h: none, strict or filters      */
     bool      no_new_privs;     /* prctl(PR_SET_NO_NEW_PRIVS); kept by fork and execve */
     struct seccomp_filter *seccomp;     /* newest filter of the chain     */
+    uint64_t  cap_eff, cap_prm, cap_inh;    /* capabilities (ns.h)         */
+    struct user_ns *userns;     /* namespaces (ns.h); NULL: the initial one */
+    struct net_ns  *netns;
+    struct ipc_ns  *ipcns;
+    struct uts_ns  *utsns;
     int       tty;              /* system_ttys[] index: /dev/tty, stdin/stdout */
 
     /* user process (ring 3); all zero for kernel threads */
@@ -181,6 +187,7 @@ struct files_struct   *files_new(void);
 struct files_struct   *files_dup(struct files_struct *src);    /* fork: same open files, own table */
 void                   files_put(struct files_struct *f);       /* closes all at the last put */
 struct fs_struct      *fs_new(struct vnode *cwd, uint32_t umask);
+struct fs_struct      *fs_copy(struct fs_struct *from);       /* fork: same cwd, root and umask */
 void                   fs_put(struct fs_struct *f);
 struct sighand_struct *sighand_new(const struct sighand_struct *copy);
 void                   sighand_put(struct sighand_struct *h);

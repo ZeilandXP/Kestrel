@@ -12,6 +12,7 @@
  * form a chain, newest first; a child shares its parent's chain, so each
  * link is reference-counted and never changes after it is installed. */
 #include <kernel/seccomp.h>
+#include <kernel/ns.h>
 #include <kernel/syscall.h>
 #include <kernel/process.h>
 #include <kernel/task.h>
@@ -384,8 +385,8 @@ static int64_t set_filter(uint64_t flags, uint64_t uprog)
     if (copy_from_user(&fp, (const void *)uprog, sizeof fp)) return -EFAULT;
     if (fp.len == 0 || fp.len > BPF_MAXINSNS) return -EINVAL;
     /* a filter could fool a set-user-ID program, so Linux wants either
-     * no_new_privs or CAP_SYS_ADMIN (here: root) */
-    if (!t->no_new_privs && t->uid != 0) return -EACCES;
+     * no_new_privs or CAP_SYS_ADMIN in the caller's user namespace */
+    if (!t->no_new_privs && !ns_capable(task_userns(t), CAP_SYS_ADMIN)) return -EACCES;
     struct seccomp_filter *n = kmalloc(sizeof *n + fp.len * sizeof(struct sock_filter));
     if (!n) return -ENOMEM;
     if (copy_from_user(n->insns, (const void *)fp.filter, fp.len * sizeof(struct sock_filter))) {

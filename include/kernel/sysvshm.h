@@ -12,5 +12,7 @@ int64_t sysv_shmdt(uint64_t addr);
 int64_t sysv_shmctl(int id, int cmd, uint64_t ubuf);
 /* /proc/sysvipc/shm */
 size_t  sysv_shm_proc(char *buf, size_t cap);
+/* an IPC namespace (ns.h) went away: its segments are removed */
+void    sysv_shm_ns_gone(uint64_t ns);
 
 #endif

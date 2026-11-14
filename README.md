@@ -971,6 +971,7 @@ The lock order is: the file tree's lock, then a volume's mutex, then the big loc
 | `dyntest` | a dynamically linked program and shared library through musl's ld.so |
 | `threadtest` | 41 checks: pthreads, TLS, mutex/condvar/semaphore contention, every futex operation and timeout, process-shared futexes, signals and threads, exit/exit_group, fork and execve from threads, robust mutexes, 450 thread lifecycles |
 | `sandboxtest` | 11 checks: seccomp filters as Firefox's and Chromium's sandboxes use them: `no_new_privs`, `seccomp(2)` and `PR_SET_SECCOMP`, errno and SIGSYS (trap) actions with the handler emulating the call, filters on arguments and on calls the kernel lacks, stacking, inheritance by fork, threads and execve, `TSYNC`, the kill actions, strict mode, and the programs and flags it refuses |
+| `nstest` | namespaces, capabilities and chroot as Firefox's sandbox uses them: user namespaces from `clone` and `unshare` with Linux's rules for `uid_map`, `gid_map` and `setgroups` (as root and as uid 1000), ids seen through the maps, capabilities that count only inside (chroot yes; mount and the machine's host name no), `capset` and `execve` dropping them, a namespace inside one, `/proc/self/ns`, a network namespace with no network and abstract `AF_UNIX` names of its own, an IPC namespace's System V shared memory, a UTS namespace's host name, the refusals, and Firefox's whole launch: `clone(CLONE_NEWUSER\|CLONE_NEWNET\|CLONE_NEWIPC)`, the maps, a chroot helper sharing the file system information, `execve`, and the chroot into the helper's `/proc/self/fdinfo`. Its checks pass on Linux too |
 | `eventtest` | 71 checks: epoll (level, edge, one-shot, nesting, fairness), eventfd, timerfd, signalfd, poll/select sleeps, ppoll masks, `SCM_RIGHTS`, record sockets, POSIX shared memory |
 | `smptest` | CPU count, real parallel speed-up, TLB shootdown (a thread on another CPU loses an unmapped page at once), racing page faults and copy-on-write on four CPUs with forks alongside, unix sockets, pipes and epoll from several CPUs, a regular file shared by four threads (shared offset, `O_APPEND`, `pwrite`) on ext2 and tmpfs, names in the file tree from four threads (create, rename, symlink, unlink, `mkdir`/`rmdir`) with listings, `/proc` and unlinked open files alongside and a working directory removed by another process, ptys driven from several CPUs (data both ways checked byte by byte while settings, window size and `FIONREAD` change alongside; canonical lines; pairs opened, closed and hung up; Ctrl+C to the foreground group), processes ending and collected on several CPUs (children waited for by pid from four threads, ending by `exit`, by `exit_group` from a thread while others run, by a leader that leaves first, by `SIGKILL`, by `execve` from a thread and after `vfork`; children collected by `wait(-1)` from four threads, each exactly once; orphans), thread churn across processes, concurrent system calls. `smptest files N`, `smptest paths N`, `smptest ttys N` and `smptest procs N` repeat the file, path, terminal or process rounds |
 
@@ -1173,14 +1174,35 @@ Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the de
 | File monitors (GLib) | inotify |
 | `/proc` and `/sys` that GTK and Firefox read | `/proc/self/{exe,fd,maps,stat,status,cmdline,mountinfo}`, `/proc/{cpuinfo,meminfo,stat}`, `/sys/devices/system/cpu` |
 | Sound | PulseAudio on `/dev/dsp` (above) |
+| Sandboxes | seccomp-bpf filters (`kernel/seccomp.c`), user, network and IPC namespaces, capabilities and `chroot` (`kernel/ns.c`, below) |
 | D-Bus | the library; a system bus (started by `/bin/startx` for `kestrel-logind`) but no session bus, and programs carry on without one |
 
 **Checked in QEMU** (no KVM, 4 CPUs, 3 GiB): `xdpyinfo` lists MIT-SHM, RENDER and Composite; xeyes and gtk3-demo draw; Firefox opens a local page with HTML, CSS gradients, a canvas and JavaScript, and a Web Audio oscillator on that page is heard in the QEMU HD Audio recording at the right pitch. In LXDE, the logout dialog's Shutdown powers QEMU off and its Reboot restarts it.
 
 **Limits:**
-- Firefox's sandboxes are off (`MOZ_DISABLE_CONTENT_SANDBOX` and the others): seccomp-bpf filters are in (`kernel/seccomp.c`), namespaces are not yet.
+- Firefox's sandboxes are on. `/usr/local/bin/firefox` sets `MOZ_ASSUME_USER_NS=1`, because Firefox's probe for user namespaces also tries a PID namespace, which Kestrel doesn't have (Firefox doesn't use one). `KESTREL_FIREFOX_SANDBOX=0` turns the sandboxes off, as in 0.3.8.
 - Slow under emulation: in QEMU without KVM (4 CPUs), Firefox's window appears about 30 s after it is started and a small local page has loaded after about 40 s. It waits about 0.05 s in all for the big kernel lock during that time, down from 5.4 s in 0.3.3 and 76 s before the scheduler, sockets, epoll and memory-map calls were taken off it.
 - No GLX on Xkestrel, no D-Bus session bus, no recording.
+
+## Sandboxes: seccomp-bpf, namespaces, capabilities
+
+What Firefox's sandbox (and Chromium's) asks of the kernel. `sandboxtest` and `nstest` check it, and their checks pass on Linux too.
+
+**seccomp-bpf** (`kernel/seccomp.c`). `seccomp(2)` and `prctl(PR_SET_SECCOMP)` install classic BPF filters that see the call number, the architecture, the instruction pointer and the arguments. A filter can allow a call, fail it with an errno, turn it into a `SIGSYS` whose handler emulates it (`si_syscall`, `si_arch`, `si_call_addr` and the registers in the ucontext), or kill the thread or the process. Filters stack, are inherited by `fork` and kept across `execve`, and `SECCOMP_FILTER_FLAG_TSYNC` gives a thread's filters to the rest of its process. Installing one needs `no_new_privs` or `CAP_SYS_ADMIN`. Strict mode is there too.
+
+**Namespaces** (`kernel/ns.c`). `clone()` and `unshare()` take `CLONE_NEWUSER`, `CLONE_NEWNET`, `CLONE_NEWIPC` and `CLONE_NEWUTS`:
+- A **user namespace** has its own uid and gid numbers. `/proc/PID/uid_map`, `gid_map` and `setgroups` follow Linux's rules: each map is written once; from inside, a process may map only its own id, and a gid only after `setgroups` is `deny`; any other map needs `CAP_SETUID` or `CAP_SETGID` in the parent namespace. `getuid()`, `stat()` and `/proc/PID/status` show ids through the maps, and an unmapped id shows as 65534. Namespaces nest, up to 32 deep.
+- A **network namespace** has no network. Its sockets can be bound and listened on, but nothing reaches them, `connect()` and `sendto()` give `ENETUNREACH`, `SIOCGIFCONF` and netlink list nothing, and it has abstract `AF_UNIX` names of its own. Named `AF_UNIX` sockets, such as the X server's, still work.
+- An **IPC namespace** has its own System V shared memory, which goes when the namespace does.
+- A **UTS namespace** has its own host and domain names (`sethostname`, `uname`, `/proc/sys/kernel/hostname`).
+
+`/proc/PID/ns` names each one (`net:[4026531840]`; `stat()` gives that inode). Not here: PID, mount, cgroup and time namespaces (`clone` and `unshare` refuse them with `EINVAL`) and `setns()`.
+
+**Capabilities.** Each thread has Linux's effective, permitted and inheritable sets. Root starts with all of them and other users with none. `capset()` drops them, `execve()` gives them back to root (in its own user namespace) and takes them from everyone else, and a change of uid away from root clears them. Where the kernel used to ask "is this uid 0?" it now asks for the capability: `CAP_SYS_BOOT` for `reboot`, `CAP_SYS_ADMIN` for `mount`, `CAP_NET_RAW` for raw sockets, and so on. A new user namespace gets every capability, but they count only inside it: enough for `chroot()` and for its own host name, never for mounting, rebooting or another user's files.
+
+**chroot.** `chroot()` (with `CAP_SYS_CHROOT`) gives a process a root of its own: absolute paths and absolute symbolic links start there, `..` stops there, and `getcwd()` marks a directory outside it `(unreachable)`. Firefox's chroot helper, which shares the file system information of the sandboxed process (`CLONE_FS`), chroots both into its own `/proc/self/fdinfo`, an empty directory that can't be written to.
+
+**Firefox.** A content process starts with `clone(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWIPC)`, writes its maps, starts the chroot helper, drops its capabilities and runs `execve`; then it asks the helper for the chroot and installs its seccomp filter. `nstest` goes through that sequence up to the chroot. `/usr/local/bin/firefox` sets `MOZ_ASSUME_USER_NS=1` because Firefox's probe for user namespaces also tries `unshare(CLONE_NEWPID)`.
 
 ## AppImages and FUSE
 

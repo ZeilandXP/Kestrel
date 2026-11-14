@@ -76,6 +76,7 @@ typedef uint32_t gid_t;
 #define EINPROGRESS 115
 #define ENAMETOOLONG 36
 #define ENOSYS       38
+#define EUSERS       87
 #define ENOTEMPTY    39
 #define EMLINK       31
 #define EMSGSIZE     90

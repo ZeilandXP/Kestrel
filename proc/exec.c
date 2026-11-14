@@ -26,6 +26,7 @@
  * there with AT_BASE, AT_PHDR, AT_ENTRY in the auxiliary vector. */
 #include <kernel/exec.h>
 #include <kernel/task.h>
+#include <kernel/ns.h>
 #include <kernel/uvm.h>
 #include <kernel/smp.h>
 #include <kernel/vm.h>
@@ -277,7 +278,8 @@ static uint64_t build_stack(struct tcb *t, const struct exec_args *a, const stru
     const uint64_t auxv[][2] = {
         { AT_PHDR, main_img->phdr }, { AT_PHENT, sizeof(struct elf64_phdr) }, { AT_PHNUM, main_img->phnum },
         { AT_PAGESZ, UVM_PAGE }, { AT_BASE, interp_base }, { AT_FLAGS, 0 }, { AT_ENTRY, main_img->entry },
-        { AT_UID, t->uid }, { AT_EUID, t->uid }, { AT_GID, t->gid }, { AT_EGID, t->gid },
+        { AT_UID, uid_view(t, t->uid) }, { AT_EUID, uid_view(t, t->uid) },
+        { AT_GID, gid_view(t, t->gid) }, { AT_EGID, gid_view(t, t->gid) },
         { AT_PLATFORM, platform }, { AT_HWCAP, cd }, { AT_HWCAP2, 0 }, { AT_CLKTCK, 100 }, { AT_SECURE, 0 },
         { AT_RANDOM, random }, { AT_EXECFN, a->argc ? argv_va[0] : platform }, { AT_MINSIGSTKSZ, sig_frame_bytes() },
         { vdso ? AT_SYSINFO_EHDR : AT_NULL, vdso }, { AT_NULL, 0 }, { AT_NULL, 0 },
@@ -438,6 +440,7 @@ static int process_main(void *arg)
         kfree(a);
         return 127;
     }
+    caps_exec(t);
     open_stdio(t, a->stdio);
     struct file *in = t->files->fd[0];
     if (a->ctty && in && in->vn->ops->fioctl)          /* a new session leader takes it */

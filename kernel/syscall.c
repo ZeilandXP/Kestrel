@@ -39,6 +39,7 @@
 #include <kernel/vdso.h>
 #include <kernel/fuse.h>
 #include <kernel/seccomp.h>
+#include <kernel/ns.h>
 
 extern void syscall_entry(void);
 
@@ -634,6 +635,79 @@ static int64_t sys_chdir(uint64_t path, uint64_t a2, uint64_t a3, uint64_t a4, u
     return r ? r : vfs_chdir(p);
 }
 
+/* chroot(): CAP_SYS_CHROOT in the caller's user namespace, so a sandbox
+ * made with a user namespace of its own may (Firefox's chroot helper). */
+static int64_t sys_chroot(uint64_t path, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    char p[VFS_PATH_MAX];
+    int r = get_path(path, p);
+    if (r) return r;
+    struct vnode *vn;
+    if ((r = vfs_lookup(p, &vn)) < 0) return r;
+    if (vn->type != VDIR) r = -ENOTDIR;
+    else if (!ns_capable(task_userns(current_task()), CAP_SYS_CHROOT)) r = -EPERM;
+    else vfs_set_root(vn);
+    vfs_vnode_put(vn);
+    return r;
+}
+
+/* unshare(): leave shared descriptors or cwd/root behind, or start new
+ * namespaces (ns.h). A new user namespace needs a single-threaded
+ * process, and takes its own cwd and root with it, as on Linux. */
+#define UNSHARE_FILES   0x00000400
+#define UNSHARE_FS      0x00000200
+#define UNSHARE_VM      0x00000100
+#define UNSHARE_SIGHAND 0x00000800
+#define UNSHARE_THREAD  0x00010000
+#define UNSHARE_SYSVSEM 0x00040000
+static int64_t sys_unshare(uint64_t flags, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    const uint64_t known = UNSHARE_FILES | UNSHARE_FS | UNSHARE_VM | UNSHARE_SIGHAND | UNSHARE_THREAD |
+                           UNSHARE_SYSVSEM | CLONE_NS_ALL;
+    if (flags & ~known) return -EINVAL;
+    if (flags & CLONE_NEWUSER) flags |= UNSHARE_THREAD | UNSHARE_FS;
+    bool alone = t->signal->nr_threads <= 1;
+    if ((flags & (UNSHARE_THREAD | UNSHARE_SIGHAND | UNSHARE_VM)) && !alone) return -EINVAL;
+    if ((flags & UNSHARE_SIGHAND) && t->sighand->refs > 1) return -EINVAL;
+    if ((flags & UNSHARE_VM) && t->mm && __atomic_load_n(&t->mm->users, __ATOMIC_ACQUIRE) > 1) return -EINVAL;
+    struct fs_struct *nfs = NULL;
+    struct files_struct *nfiles = NULL;
+    if ((flags & UNSHARE_FS) && t->fs->refs > 1 && !(nfs = fs_copy(t->fs))) return -ENOMEM;
+    if ((flags & UNSHARE_FILES) && t->files->refs > 1 && !(nfiles = files_dup(t->files))) { fs_put(nfs); return -ENOMEM; }
+    int64_t r = ns_unshare(flags & CLONE_NS_ALL);
+    if (r) { fs_put(nfs); files_put(nfiles); return r; }
+    uint64_t fl = spin_lock_irqsave(&proc_lock);        /* /proc reads them under it */
+    struct fs_struct *ofs = NULL;
+    struct files_struct *ofiles = NULL;
+    if (nfs) { ofs = t->fs; t->fs = nfs; }
+    if (nfiles) { ofiles = t->files; t->files = nfiles; }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    fs_put(ofs);
+    files_put(ofiles);
+    return 0;
+}
+
+static int64_t sys_sethostname(uint64_t name, uint64_t len, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    char buf[65];
+    if (len > 64) return -EINVAL;
+    if (copy_from_user(buf, (const void *)name, len)) return -EFAULT;
+    return uts_set(true, buf, len);
+}
+
+static int64_t sys_setdomainname(uint64_t name, uint64_t len, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    char buf[65];
+    if (len > 64) return -EINVAL;
+    if (copy_from_user(buf, (const void *)name, len)) return -EFAULT;
+    return uts_set(false, buf, len);
+}
+
 static int64_t sys_fchdir(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
@@ -758,10 +832,20 @@ static int64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t a3, uint64_t a4, 
 }
 
 /* Only root may give files away. */
+/* the ids, from the caller's user namespace to the kernel's (-1: unchanged) */
+static int chown_ids(uint64_t *uid, uint64_t *gid)
+{
+    struct tcb *t = current_task();
+    if ((int32_t)*uid != -1) { int64_t k = uid_kernel(t, (uint32_t)*uid); if (k < 0) return -EINVAL; *uid = (uint64_t)k; }
+    if ((int32_t)*gid != -1) { int64_t k = gid_kernel(t, (uint32_t)*gid); if (k < 0) return -EINVAL; *gid = (uint64_t)k; }
+    return 0;
+}
+
 static int64_t sys_fchownat(uint64_t dirfd, uint64_t path, uint64_t uid, uint64_t gid, uint64_t flags, uint64_t a6)
 {
     (void)a6;
-    if (current_task()->uid != 0) return -EPERM;
+    if (!capable(CAP_CHOWN)) return -EPERM;
+    if (chown_ids(&uid, &gid)) return -EINVAL;
     char p[VFS_PATH_MAX];
     long n = strncpy_from_user(p, (const char *)path, sizeof p);
     if (n < 0) return n == -ENAMETOOLONG ? n : -EFAULT;
@@ -790,7 +874,8 @@ static int64_t sys_lchown(uint64_t path, uint64_t uid, uint64_t gid, uint64_t a4
 static int64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
-    if (current_task()->uid != 0) return -EPERM;
+    if (!capable(CAP_CHOWN)) return -EPERM;
+    if (chown_ids(&uid, &gid)) return -EINVAL;
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
     int r = vfs_chown_vn(f->vn, (int)uid, (int)gid);
@@ -836,11 +921,12 @@ static int64_t sys_getpid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, ui
 static int64_t sys_getppid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { UNUSED6(a1, a2, a3, a4, a5, a6); return current_task()->ppid; }
 
+/* ids as the caller's user namespace numbers them (ns.h) */
 static int64_t sys_getuid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
-{ UNUSED6(a1, a2, a3, a4, a5, a6); return current_task()->uid; }
+{ UNUSED6(a1, a2, a3, a4, a5, a6); struct tcb *t = current_task(); return uid_view(t, t->uid); }
 
 static int64_t sys_getgid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
-{ UNUSED6(a1, a2, a3, a4, a5, a6); return current_task()->gid; }
+{ UNUSED6(a1, a2, a3, a4, a5, a6); struct tcb *t = current_task(); return gid_view(t, t->gid); }
 
 static int64_t sys_sched_yield(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { UNUSED6(a1, a2, a3, a4, a5, a6); sched_yield(); return 0; }
@@ -968,11 +1054,13 @@ static int64_t sys_uname(uint64_t p, uint64_t a2, uint64_t a3, uint64_t a4, uint
     struct utsname u;
     memset(&u, 0, sizeof u);
     strlcpy(u.sysname, KESTREL_NAME, sizeof u.sysname);
-    strlcpy(u.nodename, KESTREL_HOSTNAME, sizeof u.nodename);
+    char host[65], domain[65];
+    uts_names(current_task(), host, domain);
+    strlcpy(u.nodename, host, sizeof u.nodename);
     strlcpy(u.release, KESTREL_RELEASE, sizeof u.release);
     strlcpy(u.version, KESTREL_CODENAME, sizeof u.version);
     strlcpy(u.machine, KESTREL_MACHINE, sizeof u.machine);
-    strlcpy(u.domainname, "(none)", sizeof u.domainname);
+    strlcpy(u.domainname, domain, sizeof u.domainname);
     return copy_to_user((void *)p, &u, sizeof u) ? -EFAULT : 0;
 }
 
@@ -982,7 +1070,7 @@ static int64_t sys_reboot(uint64_t m1, uint64_t m2, uint64_t cmd, uint64_t a4, u
     (void)a4; (void)a5; (void)a6;
     if (m1 != 0xfee1deadu || (m2 != 672274793u && m2 != 85072278u && m2 != 369367448u && m2 != 537993216u))
         return -EINVAL;
-    if (current_task()->user && current_task()->uid != 0) return -EPERM;   /* CAP_SYS_BOOT: root */
+    if (!capable(CAP_SYS_BOOT)) return -EPERM;
     switch ((uint32_t)cmd) {
     case 0x01234567u:                                   /* RESTART */
     case 0xA1B2C3D4u:                                   /* RESTART2 (argument ignored) */
@@ -1312,7 +1400,7 @@ static int64_t sys_get_robust_list(uint64_t tid, uint64_t uhead, uint64_t ulen, 
     (void)a4; (void)a5; (void)a6;
     struct tcb *self = current_task(), *t = tid ? task_find((int)tid) : self;
     if (!t || t->state == TASK_UNUSED || t->state == TASK_ZOMBIE || !t->user) return -ESRCH;
-    if (t->signal != self->signal && t->uid != self->uid && self->uid) return -EPERM;
+    if (t->signal != self->signal && t->uid != self->uid && !capable(CAP_SYS_ADMIN)) return -EPERM;
     if (put_user_u64((void *)uhead, t->robust_list) || put_user_u64((void *)ulen, 24)) return -EFAULT;
     return 0;
 }
@@ -2688,14 +2776,22 @@ done:
 }
 
 /* ---- user and group ids: one uid and one gid per process (real = effective
- * = saved); root may switch to any id, everyone else only to their own ---- */
+ * = saved), numbered as the caller's user namespace numbers them (ns.h).
+ * CAP_SETUID/CAP_SETGID (root's, in that namespace) may switch to any id
+ * mapped there, everyone else only to their own. Leaving root drops the
+ * capabilities. ---- */
 static int64_t set_id(uint32_t *field, int64_t want)
 {
     struct tcb *t = current_task();
+    bool gid = field == &t->gid;
     if (want == -1) return 0;                           /* "unchanged" */
     if (want < 0) return -EINVAL;
-    if (t->uid != 0 && (uint32_t)want != *field) return -EPERM;
-    *field = (uint32_t)want;
+    int64_t k = gid ? gid_kernel(t, (uint32_t)want) : uid_kernel(t, (uint32_t)want);
+    if (k < 0) return -EINVAL;                          /* no such id in this namespace */
+    if ((uint32_t)k != *field && !ns_capable(task_userns(t), gid ? CAP_SETGID : CAP_SETUID)) return -EPERM;
+    uint32_t old = *field;
+    *field = (uint32_t)k;
+    if (!gid) caps_setuid(t, old);
     return 0;
 }
 static int64_t sys_setuid(uint64_t id, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
@@ -2706,9 +2802,10 @@ static int64_t sys_setgid(uint64_t id, uint64_t a2, uint64_t a3, uint64_t a4, ui
  * effective id is the one that counts; the others must agree or be -1. */
 static int64_t set_ids(uint32_t *field, int64_t r, int64_t e, int64_t s)
 {
+    struct tcb *t = current_task();
     int64_t want = e != -1 ? e : r != -1 ? r : s;
     if ((r != -1 && r != want) || (s != -1 && s != want)) {
-        if (current_task()->uid != 0) return -EPERM;
+        if (!ns_capable(task_userns(t), field == &t->gid ? CAP_SETGID : CAP_SETUID)) return -EPERM;
     }
     return set_id(field, want);
 }
@@ -2726,13 +2823,20 @@ static int64_t get_ids(uint32_t v, uint64_t r, uint64_t e, uint64_t sv)
     return 0;
 }
 static int64_t sys_getresuid(uint64_t r, uint64_t e, uint64_t sv, uint64_t a4, uint64_t a5, uint64_t a6)
-{ (void)a4; (void)a5; (void)a6; return get_ids(current_task()->uid, r, e, sv); }
+{ (void)a4; (void)a5; (void)a6; struct tcb *t = current_task(); return get_ids(uid_view(t, t->uid), r, e, sv); }
 static int64_t sys_getresgid(uint64_t r, uint64_t e, uint64_t sv, uint64_t a4, uint64_t a5, uint64_t a6)
-{ (void)a4; (void)a5; (void)a6; return get_ids(current_task()->gid, r, e, sv); }
+{ (void)a4; (void)a5; (void)a6; struct tcb *t = current_task(); return get_ids(gid_view(t, t->gid), r, e, sv); }
 static int64_t sys_getgroups(uint64_t n, uint64_t list, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)list; (void)a3; (void)a4; (void)a5; (void)a6; return (int32_t)n < 0 ? -EINVAL : 0; }   /* no supplementary groups */
 static int64_t sys_setgroups(uint64_t n, uint64_t list, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
-{ (void)list; (void)a3; (void)a4; (void)a5; (void)a6; return current_task()->uid == 0 || n == 0 ? 0 : -EPERM; }
+{
+    (void)list; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    /* Linux: CAP_SETGID, and in a user namespace only if its setgroups says
+     * "allow" and its gid_map is written (no supplementary groups here) */
+    if (!ns_capable(task_userns(t), CAP_SETGID) || !setgroups_allowed(t)) return -EPERM;
+    return 0;
+}
 
 /* ---- resource limits: fixed by the kernel, reported Linux-style ------------ */
 #define RLIM_INF (~0ull)
@@ -2891,9 +2995,10 @@ static int64_t sys_capget(uint64_t uhdr, uint64_t udata, uint64_t a3, uint64_t a
     int words, r = cap_words(uhdr, &words);
     if (r) return r;
     if (!udata) return 0;
-    bool root = current_task()->uid == 0;
+    uint32_t hdr[2];
+    if (copy_from_user(hdr, (const void *)uhdr, sizeof hdr)) return -EFAULT;
     uint32_t d[6] = { 0 };                              /* {effective, permitted, inheritable} per word */
-    if (root) { d[0] = d[1] = 0xffffffffu; d[3] = d[4] = 0x1ffu; }
+    if ((r = (int)caps_get((int)hdr[1], d))) return r;
     return copy_to_user((void *)udata, d, (size_t)words * 12) ? -EFAULT : 0;
 }
 static int64_t sys_capset(uint64_t uhdr, uint64_t udata, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
@@ -2901,11 +3006,12 @@ static int64_t sys_capset(uint64_t uhdr, uint64_t udata, uint64_t a3, uint64_t a
     (void)a3; (void)a4; (void)a5; (void)a6;
     int words, r = cap_words(uhdr, &words);
     if (r) return r;
+    uint32_t hdr[2];
+    if (copy_from_user(hdr, (const void *)uhdr, sizeof hdr)) return -EFAULT;
+    if (hdr[1] && (int)hdr[1] != current_task()->pid) return -EPERM;     /* only one's own */
     uint32_t d[6] = { 0 };
     if (copy_from_user(d, (const void *)udata, (size_t)words * 12)) return -EFAULT;
-    if (current_task()->uid == 0) return 0;
-    for (int i = 0; i < words * 3; i++) if (d[i]) return -EPERM;  /* nothing to raise */
-    return 0;
+    return caps_set(d, words);
 }
 
 /* glibc falls back to ftruncate + writes (posix_fallocate) */
@@ -3436,7 +3542,7 @@ static struct vnode *pseudo_root(const char *fstype)
 static int64_t sys_mount(uint64_t usrc, uint64_t utarget, uint64_t utype, uint64_t flags, uint64_t udata, uint64_t a6)
 {
     (void)a6;
-    if (current_task()->uid) return -EPERM;
+    if (!capable(CAP_SYS_ADMIN)) return -EPERM;
     if ((flags & 0xffff0000u) == 0xc0ed0000u) flags &= 0xffff;      /* MS_MGC_VAL, from old programs */
     char *target = kmalloc(VFS_PATH_MAX), *canon = kmalloc(VFS_PATH_MAX), *src = kzalloc(VFS_PATH_MAX);
     char *opts = kzalloc(PAGE_SIZE), type[256] = "";
@@ -3517,7 +3623,7 @@ out:
 static int64_t sys_umount2(uint64_t utarget, uint64_t flags, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    if (current_task()->uid) return -EPERM;
+    if (!capable(CAP_SYS_ADMIN)) return -EPERM;
     if (flags & ~0xfull) return -EINVAL;                /* FORCE DETACH EXPIRE NOFOLLOW */
     if ((flags & 4) && (flags & 3)) return -EINVAL;     /* MNT_EXPIRE with FORCE or DETACH */
     char p[VFS_PATH_MAX];
@@ -3641,6 +3747,8 @@ void syscall_init(void)
     REG(SYS_pipe2, sys_pipe2);         REG(SYS_access, sys_access);
     REG(SYS_umask, sys_umask);         REG(SYS_getrandom, sys_getrandom);
     REG(SYS_seccomp, sys_seccomp);
+    REG(SYS_chroot, sys_chroot);       REG(SYS_unshare, sys_unshare);
+    REG(SYS_sethostname, sys_sethostname); REG(SYS_setdomainname, sys_setdomainname);
     REG(SYS_socket, sys_socket);       REG(SYS_socketpair, sys_socketpair);
     REG(SYS_bind, sys_bind);           REG(SYS_listen, sys_listen);
     REG(SYS_connect, sys_connect);     REG(SYS_accept, sys_accept);

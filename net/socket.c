@@ -11,6 +11,7 @@
  * configuration. */
 #include "sock.h"
 #include <kernel/socket.h>
+#include <kernel/ns.h>
 #include <kernel/task.h>
 #include <kernel/process.h>
 #include <kernel/string.h>
@@ -99,7 +100,7 @@ int inet_create(int type, int protocol, struct file **out)
         break;
     case SOCK_RAW:
         if (protocol != IPPROTO_ICMP && protocol != IPPROTO_RAW) return -EPROTONOSUPPORT;
-        if (current_task()->uid != 0) return -EPERM;
+        if (!capable(CAP_NET_RAW)) return -EPERM;
         proto = protocol;
         break;
     default:
@@ -107,8 +108,11 @@ int inet_create(int type, int protocol, struct file **out)
     }
     struct isock *s = isock_new(type, proto);
     if (!s) return -ENOMEM;
+    s->isolated = !netns_initial(current_task());
     uint64_t f = net_lock();
-    if (proto == IPPROTO_TCP) {
+    if (s->isolated) {
+        /* not registered with the stack */
+    } else if (proto == IPPROTO_TCP) {
         int rc = tcp_attach(s);
         if (rc) { net_unlock(f); kfree(s); return rc; }
     } else {
@@ -116,7 +120,13 @@ int inet_create(int type, int protocol, struct file **out)
     }
     net_unlock(f);
     struct file *file = vfs_file_new(&s->vn, O_RDWR | ((flags & SOCK_NONBLOCK) ? O_NONBLOCK : 0));
-    if (!file) { uint64_t g = net_lock(); if (s->tcb) tcp_close(s); else dgram_unregister(s); net_unlock(g); kfree(s); return -ENOMEM; }
+    if (!file) {
+        uint64_t g = net_lock();
+        if (s->tcb) tcp_close(s); else if (!s->isolated) dgram_unregister(s);
+        net_unlock(g);
+        kfree(s);
+        return -ENOMEM;
+    }
     *out = file;
     return 0;
 }
@@ -153,12 +163,20 @@ int inet_bind(struct file *f, const void *addr, uint32_t len)
     uint64_t fl = net_lock();
     int rc = 0;
     if (s->lport && s->type != SOCK_RAW) { rc = -EINVAL; goto out; }
+    if (s->isolated) {          /* every interface is down: Linux takes any address, and nothing arrives */
+        if (sin.sin_port && be16(sin.sin_port) < 1024 && !ns_capable(task_userns(current_task()), CAP_NET_BIND_SERVICE)) {
+            rc = -EACCES; goto out;
+        }
+        s->laddr = sin.sin_addr;
+        if (s->type != SOCK_RAW) s->lport = sin.sin_port ? sin.sin_port : port_ephemeral(s->proto);
+        goto out;
+    }
     if (sin.sin_addr && !ip_is_local(sin.sin_addr) && sin.sin_addr != 0xffffffffu && (sin.sin_addr & 0xf0) != 0xe0) {
         rc = -EADDRNOTAVAIL; goto out;
     }
     if (s->type == SOCK_RAW) { s->laddr = sin.sin_addr; goto out; }
     uint16_t port = sin.sin_port;
-    if (port && be16(port) < 1024 && current_task()->uid != 0) { rc = -EACCES; goto out; }
+    if (port && be16(port) < 1024 && !capable(CAP_NET_BIND_SERVICE)) { rc = -EACCES; goto out; }
     if (!port) {
         port = port_ephemeral(s->proto);
         if (!port) { rc = -EADDRINUSE; goto out; }
@@ -178,6 +196,12 @@ int inet_listen(struct file *f, int backlog)
     struct isock *s = isk(f);
     if (s->type != SOCK_STREAM) return -EOPNOTSUPP;
     uint64_t fl = net_lock();
+    if (s->isolated) {
+        if (!s->lport) s->lport = port_ephemeral(IPPROTO_TCP);
+        s->listening = true;
+        net_unlock(fl);
+        return 0;
+    }
     int rc = tcp_listen(s, backlog);
     net_unlock(fl);
     return rc;
@@ -198,6 +222,7 @@ static int inet_connect_(struct file *f, const void *addr, uint32_t len)
     }
     int rc = get_sin(addr, len, &sin);
     if (rc) return rc;
+    if (s->isolated) return s->listening ? -EINVAL : -ENETUNREACH;
     if (s->type == SOCK_STREAM) return tcp_connect(s, f, sin.sin_addr, sin.sin_port);
     uint64_t fl = net_lock();
     if (sin.sin_addr == 0xffffffffu && !s->broadcast) { net_unlock(fl); return -EACCES; }
@@ -212,10 +237,25 @@ static int inet_connect_(struct file *f, const void *addr, uint32_t len)
     return 0;
 }
 
+/* accept() or recv() on a socket nothing can ever reach: wait for a signal
+ * or the timeout, as on Linux (the entry point holds net_lock) */
+static int isolated_wait(struct isock *s, struct file *f, int flags, bool ok)
+{
+    if (!ok) return -EINVAL;
+    if ((f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT)) return -EAGAIN;
+    uint64_t deadline = sock_deadline(s->rcvtimeo);
+    for (;;) {
+        if (s->shut_rd) return 0;
+        int rc = sock_wait(s, deadline);
+        if (rc) return rc;
+    }
+}
+
 static int inet_accept_(struct file *f, int flags, struct file **out, struct sockaddr_in *peer)
 {
     struct isock *s = isk(f);
     if (s->type != SOCK_STREAM) return -EOPNOTSUPP;
+    if (s->isolated) return isolated_wait(s, f, 0, s->listening);
     struct isock *ns;
     int rc = tcp_accept(s, f, &ns);
     if (rc) return rc;
@@ -256,6 +296,11 @@ static long raw_ip_send(struct isock *s, const uint8_t *buf, size_t len)
 static long inet_sendto_(struct file *f, const void *buf, size_t len, int flags, const void *to, uint32_t tolen)
 {
     struct isock *s = isk(f);
+    if (s->isolated) {
+        if (s->type == SOCK_STREAM) return s->shut_wr ? -EPIPE : -ENOTCONN;
+        if (s->shut_wr) return -EPIPE;
+        return (to && tolen) || s->connected ? -ENETUNREACH : -EDESTADDRREQ;
+    }
     if (s->type == SOCK_STREAM) {
         return tcp_send(s, f, buf, len, flags);       /* an address is ignored, as on Linux */
     }
@@ -288,6 +333,8 @@ static long inet_sendto_(struct file *f, const void *buf, size_t len, int flags,
 static long inet_recvfrom_(struct file *f, void *buf, size_t len, int flags, struct sockaddr_in *from, int *msg_flags)
 {
     struct isock *s = isk(f);
+    if (s->isolated && s->type == SOCK_STREAM) return -ENOTCONN;
+    if (s->isolated) return isolated_wait(s, f, flags, true);
     if (s->type == SOCK_STREAM) {
         long n = tcp_recv(s, f, buf, len, flags);
         if (from && n >= 0) {
@@ -304,6 +351,10 @@ static long inet_recvfrom_(struct file *f, void *buf, size_t len, int flags, str
 static int inet_shutdown_(struct file *f, int how)
 {
     struct isock *s = isk(f);
+    if (s->isolated) {
+        if (s->type == SOCK_STREAM && s->listening) { s->shut_rd = s->shut_wr = true; wakeup(s); return 0; }
+        return -ENOTCONN;
+    }
     if (s->type == SOCK_STREAM) return tcp_shutdown(s, how);
     if (!s->connected) return -ENOTCONN;
     if (how != SHUT_WR) s->shut_rd = true;
@@ -412,7 +463,7 @@ static int inet_setsockopt_(struct file *f, int level, int opt, const void *val,
         switch (opt) {
         case TCP_NODELAY:
             s->nodelay = v != 0;
-            { uint64_t fl = net_lock(); tcp_setopt_nodelay(s); net_unlock(fl); }
+            if (s->tcb) { uint64_t fl = net_lock(); tcp_setopt_nodelay(s); net_unlock(fl); }
             return 0;
         case TCP_CORK: case TCP_KEEPIDLE: case TCP_KEEPINTVL: case TCP_KEEPCNT: case TCP_QUICKACK:
         case TCP_MAXSEG: case TCP_USER_TIMEOUT: case TCP_FASTOPEN:
@@ -445,7 +496,7 @@ static int inet_getsockopt_(struct file *f, int level, int opt, void *val, uint3
         case SO_REUSEPORT: v = s->reuseport; break;
         case SO_BROADCAST: v = s->broadcast; break;
         case SO_KEEPALIVE: v = s->keepalive; break;
-        case SO_ACCEPTCONN: v = s->tcb && tcp_info_state(s) == 10; break;
+        case SO_ACCEPTCONN: v = s->listening || (s->tcb && tcp_info_state(s) == 10); break;
         case SO_RCVBUF:    v = s->tcb ? tcp_bufsize(s, true) : (int)s->rcvbuf; break;
         case SO_SNDBUF:    v = s->tcb ? tcp_bufsize(s, false) : (int)s->sndbuf; break;
         case SO_RCVTIMEO: case SO_SNDTIMEO: {
@@ -562,6 +613,7 @@ static void set_sin(struct sockaddr_in *a, uint32_t ip)
 static int net_ifconf_(void *kbuf, int len)
 {
     int n = 0;
+    if (!netns_initial(current_task())) return 0;      /* a namespace of its own: no addresses */
     for (struct netif *i = netif_list(); i; i = i->next) {
         if (!i->ip) continue;
         if (kbuf) {
@@ -580,7 +632,8 @@ static int net_ioctl_(unsigned long req, void *arg)
 {
     if (req == SIOCADDRT || req == SIOCDELRT) {
         struct rtentry_k *rt = arg;
-        if (current_task()->uid != 0) return -EPERM;
+        if (!capable(CAP_NET_ADMIN)) return -EPERM;
+        if (!netns_initial(current_task())) return -ENETUNREACH;
         uint32_t dst = rt->dst.sin_addr, mask = (rt->flags & RTF_HOST) ? 0xffffffffu : rt->mask.sin_addr;
         uint32_t gw = (rt->flags & RTF_GATEWAY) ? rt->gw.sin_addr : 0;
         uint64_t fl = net_lock();
@@ -596,6 +649,7 @@ static int net_ioctl_(unsigned long req, void *arg)
     }
     struct ifreq_k *r = arg;
     r->name[IFNAMSIZ - 1] = 0;
+    if (!netns_initial(current_task())) return -ENODEV;   /* none of the machine's interfaces */
     if (req == SIOCGIFNAME) {
         struct netif *n = netif_by_index(r->u.ival);
         if (!n) return -ENODEV;
@@ -606,7 +660,7 @@ static int net_ioctl_(unsigned long req, void *arg)
     if (!n) return -ENODEV;
     bool set = req == SIOCSIFFLAGS || req == SIOCSIFADDR || req == SIOCSIFNETMASK || req == SIOCSIFMTU ||
                req == SIOCSIFBRDADDR;
-    if (set && current_task()->uid != 0) return -EPERM;
+    if (set && !capable(CAP_NET_ADMIN)) return -EPERM;
     uint64_t fl = net_lock();
     int rc = 0;
     switch (req) {
@@ -659,7 +713,9 @@ static int inet_poll(struct file *f, int events)
     uint64_t fl = net_lock();
     poll_wait(s);
     if (s->type == SOCK_STREAM && s->tcb) poll_wait(s->tcb);    /* tcp.c wakes the connection */
-    if (s->type == SOCK_STREAM) r = tcp_poll(s);
+    if (s->isolated && s->type == SOCK_STREAM)          /* Linux: an unconnected TCP socket */
+        r = s->listening ? (s->shut_rd ? POLLHUP : 0) : POLLOUT | POLLWRNORM | POLLHUP;
+    else if (s->type == SOCK_STREAM) r = tcp_poll(s);
     else {
         r = POLLOUT | POLLWRNORM;
         if (s->rq || s->shut_rd) r |= POLLIN | POLLRDNORM;
@@ -688,7 +744,8 @@ static void inet_release(struct file *f)
 {
     struct isock *s = isk(f);
     uint64_t fl = net_lock();
-    if (s->type == SOCK_STREAM) tcp_close(s);
+    if (s->isolated) { /* nothing registered */ }
+    else if (s->type == SOCK_STREAM) tcp_close(s);
     else { dgram_unregister(s); dgram_flush(s); }
     wakeup(s);
     net_unlock(fl);
