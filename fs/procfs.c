@@ -369,6 +369,7 @@ struct pid_info {
     struct tcb t;
     int        threads;
     uint64_t   shared_pending;
+    bool       stopped;             /* job control: T (stopped) */
     uint64_t   rss;                 /* resident pages */
     uint64_t   end_data;            /* where the heap starts: the end of the image */
 };
@@ -384,6 +385,7 @@ static struct pid_info *pid_copy(void *ctx)
         c->t = *t;
         c->threads = t->signal ? t->signal->nr_threads : 0;
         c->shared_pending = t->signal ? t->signal->shared_pending : 0;
+        c->stopped = t->user && t->signal && t->signal->stopped && t->state != TASK_ZOMBIE;
         if (mm) mm_get(mm);                             /* task_mm_get() */
     }
     spin_unlock_irqrestore(&proc_lock, f);
@@ -408,7 +410,7 @@ static size_t gen_pid_stat(char *buf, size_t cap, void *ctx)
      * majflt cmajflt utime stime cutime cstime priority nice threads
      * itrealvalue starttime vsize rss ... (52 fields) */
     P("%d (%s) %c %d %d %d %d -1 %u 0 0 0 0 %lu 0 0 0 20 0 %d 0 %lu %lu %lu",
-      t->pid, t->name, state_char(t), t->ppid, t->pgid, t->sid, tty, t->user ? 0u : 0x200000u,
+      t->pid, t->name, c->stopped ? 'T' : state_char(t), t->ppid, t->pgid, t->sid, tty, t->user ? 0u : 0x200000u,
       ticks, c->threads, start, pages * 4096, pages);
     /* startcode and endcode: 0 only for kernel threads, which is how
      * killall5 and ps tell them apart */
@@ -428,7 +430,7 @@ static size_t gen_pid_status(char *buf, size_t cap, void *ctx)
                                          "Z (zombie)" };
     uint64_t pages = c->rss;
     P("Name:\t%s\nState:\t%s\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n", t->name,
-      t->state <= TASK_ZOMBIE ? names[t->state] : "?", t->tgid, t->pid, t->ppid);
+      c->stopped ? "T (stopped)" : t->state <= TASK_ZOMBIE ? names[t->state] : "?", t->tgid, t->pid, t->ppid);
     struct tcb *me = current_task();                    /* ids as the reader's namespace numbers them */
     uint32_t u = uid_view(me, t->uid), g = gid_view(me, t->gid);
     P("Uid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\n", u, u, u, u, g, g, g, g);

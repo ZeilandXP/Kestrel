@@ -488,9 +488,21 @@ static void master_release(struct file *f)
 }
 
 /* ---- slave side ------------------------------------------------------------ */
+/* Job control: a background process of the terminal's session reading
+ * from it gets SIGTTIN, and writing to it (with TOSTOP) or changing its
+ * settings SIGTTOU (process.c decides). Only the controlling terminal. */
+static int bg_check(struct pty *p, int sig)
+{
+    struct tcb *t = current_task();
+    if (!t->user || t->ctty != p->index + 1) return 0;
+    return proc_tty_background(__atomic_load_n(&p->fg_pgrp, __ATOMIC_RELAXED), sig);
+}
+
 static ssize_t slave_read(struct file *f, void *buf, size_t len)
 {
     struct pty *p = pty_of(f);
+    int bg = bg_check(p, SIGTTIN);
+    if (bg) return bg;
     if (!len) return 0;
     uint64_t fl = spin_lock_irqsave(&p->lock);
     uint8_t vmin = p->tio.c_cc[VMIN], vtime = p->tio.c_cc[VTIME];
@@ -535,6 +547,10 @@ static ssize_t slave_read(struct file *f, void *buf, size_t len)
 static ssize_t slave_write(struct file *f, const void *buf, size_t len)
 {
     struct pty *p = pty_of(f);
+    if (__atomic_load_n(&p->tio.c_lflag, __ATOMIC_RELAXED) & TL_TOSTOP) {
+        int bg = bg_check(p, SIGTTOU);
+        if (bg) return bg;
+    }
     uint64_t fl = spin_lock_irqsave(&p->lock);
     size_t done = 0;
     ssize_t err = -EAGAIN;
@@ -607,6 +623,7 @@ static int pty_ioctl_owner(struct pty *p, bool master, unsigned long req, void *
         if (master || t->ctty != p->index + 1) return -ENOTTY;
         int32_t g = *(const int32_t *)arg;
         if (g <= 0) return -EINVAL;
+        if (p->session != t->sid || !proc_pgrp_in_session(g, t->sid)) return -EPERM;
         p->fg_pgrp = g;
         return 0;
     }
@@ -620,6 +637,10 @@ static int pty_ioctl(struct file *f, unsigned long req, void *arg)
     struct pty *p = pty_of(f);
     bool master = f->vn->ops == &master_ops;
     struct tcb *t = current_task();
+    if (!master && (req == TIOCSPGRP || req == TCSETS || req == TCSETSW || req == TCSETSF)) {
+        int bg = bg_check(p, SIGTTOU);                  /* a background group may not */
+        if (bg) return bg;
+    }
     if (req == TIOCSCTTY || req == TIOCNOTTY || req == TIOCSPGRP) {
         uint64_t fl = spin_lock_irqsave(&proc_lock);
         int r = pty_ioctl_owner(p, master, req, arg);

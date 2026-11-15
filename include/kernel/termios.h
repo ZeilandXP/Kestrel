@@ -47,6 +47,7 @@ struct kwinsize {
 #define TL_ECHOK    0000040
 #define TL_ECHONL   0000100
 #define TL_NOFLSH   0000200
+#define TL_TOSTOP   0000400
 #define TL_ECHOCTL  0001000
 #define TL_ECHOKE   0004000
 #define TL_IEXTEN   0100000

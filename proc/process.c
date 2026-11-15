@@ -59,6 +59,8 @@ extern void user_return(struct int_frame *f) __attribute__((noreturn));
                               CLONE_CHILD_SETTID | CLONE_IO | CLONE_CLEAR_SIGHAND | CLONE_NS_SUPPORTED)
 
 #define WNOHANG     1
+#define WUNTRACED   2
+#define WCONTINUED_ 8
 
 #define EXEC_MAX_STRINGS    1024            /* argv + envp entries        */
 #define EXEC_MAX_BYTES      (128u << 10)    /* their total size            */
@@ -129,6 +131,7 @@ static void vfork_release(struct tcb *t)
 
 static int send_thread_locked(struct tcb *t, int sig, const struct ksig_info *info);
 static int send_info_locked(struct tcb *t, int sig, const struct ksig_info *info);
+static void orphan_check_locked(struct tcb *t);
 
 /* Send a thread-directed SIGKILL to every other live thread of t's group.
  * proc_lock held. */
@@ -174,6 +177,7 @@ void process_exit(struct tcb *t)
     /* Orphans go to init (pid 1) when it is a program, as on Linux, and it
      * collects them; with the kernel's own init they are reaped by the
      * kernel. A zombie among them is reported to init at once. */
+    if (t->user) orphan_check_locked(t);              /* before its children move to init */
     struct tcb *init = t->tgid != 1 ? task_find(1) : NULL;
     if (!proc_alive(init) || !init->user || init->tgid != 1) init = NULL;
     bool orphan_zombie = false;
@@ -598,14 +602,26 @@ int64_t proc_wait4(int64_t pid, uint64_t ustatus, uint64_t options, uint64_t rus
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (;;) {
         bool any = false;
-        struct tcb *z = NULL;
-        for (int i = 0; i < MAX_TASKS && !z; i++) {
+        struct tcb *z = NULL, *job = NULL;
+        for (int i = 0; i < MAX_TASKS && !z && !job; i++) {
             struct tcb *c = task_slot(i);
             if (!wait_matches(self, c, pid)) continue;
             any = true;
             if (c->signal && c->signal->nr_threads == 0) z = c;     /* every thread gone */
+            else if (c->signal && (((options & WUNTRACED) && c->signal->notify == JOB_NOTIFY_STOPPED && c->signal->stopped) ||
+                                   ((options & WCONTINUED_) && c->signal->notify == JOB_NOTIFY_CONTINUED)))
+                job = c;                                /* stopped or continued: reported once */
         }
         if (!any) { spin_unlock_irqrestore(&proc_lock, fl); return -ECHILD; }
+        if (job) {
+            int status = job->signal->notify == JOB_NOTIFY_STOPPED ? (job->signal->stop_sig << 8) | 0x7f : 0xffff;
+            int jpid = job->pid;
+            job->signal->notify = 0;
+            spin_unlock_irqrestore(&proc_lock, fl);
+            if (ustatus && put_user_u32((void *)ustatus, (uint32_t)status)) return -EFAULT;
+            if (rusage && clear_user((void *)rusage, 144)) return -EFAULT;
+            return jpid;
+        }
         if (z) {
             int status = z->term_signal ? (z->term_signal & 0x7f) : ((z->exit_code & 0xff) << 8);
             int zpid = z->pid;
@@ -623,7 +639,7 @@ int64_t proc_wait4(int64_t pid, uint64_t ustatus, uint64_t options, uint64_t rus
 }
 
 /* waitid(idtype, id, infop, options): wait4 with a siginfo for the result,
- * and WNOWAIT to look without reaping. No job control: only exits are seen. */
+ * and WNOWAIT to look without reaping; WSTOPPED and WCONTINUED as in wait4. */
 #define P_ALL     0
 #define P_PID     1
 #define P_PGID    2
@@ -648,14 +664,31 @@ int64_t proc_waitid(int64_t idtype, int64_t id, uint64_t infop, uint64_t options
     uint64_t fl = spin_lock_irqsave(&proc_lock);
     for (;;) {
         bool any = false;
-        struct tcb *z = NULL;
-        for (int i = 0; i < MAX_TASKS && !z; i++) {
+        struct tcb *z = NULL, *job = NULL;
+        for (int i = 0; i < MAX_TASKS && !z && !job; i++) {
             struct tcb *c = task_slot(i);
             if (!wait_matches(self, c, pid)) continue;
             any = true;
-            if ((options & WEXITED) && c->signal && c->signal->nr_threads == 0) z = c;
+            if (!c->signal) continue;
+            if (c->signal->nr_threads == 0) { if (options & WEXITED) z = c; }
+            else if (((options & WSTOPPED) && c->signal->notify == JOB_NOTIFY_STOPPED && c->signal->stopped) ||
+                     ((options & WCONTINUED) && c->signal->notify == JOB_NOTIFY_CONTINUED))
+                job = c;
         }
         if (!any) { spin_unlock_irqrestore(&proc_lock, fl); return -ECHILD; }
+        if (job) {
+            int32_t info[32] = { 0 };
+            bool stop = job->signal->notify == JOB_NOTIFY_STOPPED;
+            info[0] = SIGCHLD;
+            info[2] = stop ? CLD_STOPPED : CLD_CONTINUED;
+            info[4] = job->pid;
+            info[5] = (int32_t)job->uid;
+            info[6] = stop ? job->signal->stop_sig : SIGCONT;
+            if (!(options & WNOWAIT)) job->signal->notify = 0;
+            spin_unlock_irqrestore(&proc_lock, fl);
+            if (infop && copy_to_user((void *)infop, info, sizeof info)) return -EFAULT;
+            return 0;
+        }
         if (z) {
             int32_t info[32] = { 0 };
             info[0] = SIGCHLD;                          /* si_signo; si_errno 0 */
@@ -742,12 +775,14 @@ static bool default_ignored(int sig)
 {
     switch (sig) {
     case SIGCHLD: case SIGCONT: case SIGURG: case SIGWINCH:
-    case SIGSTOP: case SIGTSTP: case SIGTTIN: case SIGTTOU:  /* no job control */
         return true;
     default:
         return false;
     }
 }
+
+static bool stop_signal(int sig) { return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU; }
+#define STOP_SIGNALS (sigbit(SIGSTOP) | sigbit(SIGTSTP) | sigbit(SIGTTIN) | sigbit(SIGTTOU))
 
 static bool ignored(const struct tcb *t, int sig)
 {
@@ -771,12 +806,162 @@ static void set_mask(struct tcb *t, uint64_t m)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
+/* ---- job control ----------------------------------------------------------
+ * A stop signal whose action is the default stops the whole process: the
+ * thread that takes it marks the group stopped, tells the parent, and kicks
+ * the other threads, and every thread then waits in signal_deliver() (on
+ * its way back to ring 3) until SIGCONT clears the mark or SIGKILL comes.
+ * Blocking calls see the stop as a pending signal and are restarted after
+ * it, as on Linux. The parent hears of each change once (WUNTRACED,
+ * WCONTINUED), and with SIGCHLD unless it asked for SA_NOCLDSTOP.
+ * proc_lock held throughout. */
+
+/* Tell t's parent that t's process stopped or continued. */
+static void notify_parent_locked(struct tcb *t, int code, int status)
+{
+    struct tcb *lead = is_leader(t) ? t : task_find(t->tgid);
+    if (!lead) return;
+    struct tcb *p = lead->ppid ? task_find(lead->ppid) : NULL;
+    if (!proc_alive(p) || !p->user || p->tgid != lead->ppid) return;
+    const struct k_sigaction *k = &p->sighand->action[SIGCHLD - 1];
+    if (!(k->flags & SA_NOCLDSTOP)) {
+        struct ksig_info ci = { .code = code, .pid = lead->tgid, .uid = lead->uid, .status = status };
+        send_info_locked(p, SIGCHLD, &ci);
+    }
+    wakeup(p->signal);                                  /* wait4(WUNTRACED | WCONTINUED) */
+}
+
+/* What sending sig does at once, whatever its action (Linux's
+ * prepare_signal): a stop signal discards a pending SIGCONT, and SIGCONT
+ * discards pending stop signals and resumes a stopped process. */
+static void prepare_locked(struct tcb *t, int sig)
+{
+    struct signal_struct *g = t->signal;
+    if (!g || (!stop_signal(sig) && sig != SIGCONT)) return;
+    uint64_t drop = sig == SIGCONT ? STOP_SIGNALS : sigbit(SIGCONT);
+    g->shared_pending &= ~drop;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *o = task_slot(i);
+        if (thread_alive(o) && same_group(o, t)) o->sig_pending &= ~drop;
+    }
+    if (sig == SIGCONT && g->stopped) {
+        g->stopped = false;
+        g->notify = JOB_NOTIFY_CONTINUED;
+        notify_parent_locked(t, CLD_CONTINUED, SIGCONT);
+        wakeup(&g->stopped);                            /* the threads waiting in signal_deliver() */
+    }
+}
+
+/* A process group is orphaned when no member has a parent in another group
+ * of the same session (POSIX): nobody is left to continue it, so terminal
+ * stop signals are not acted on and terminal access fails instead. */
+static bool pgrp_orphaned_locked(int pgid, const struct tcb *except)
+{
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *c = task_slot(i);
+        if (c == except || !proc_alive(c) || !c->user || !is_leader(c) || c->pgid != pgid) continue;
+        struct tcb *p = c->ppid ? task_find(c->ppid) : NULL;
+        if (p && p != except && proc_alive(p) && p->user && p->pgid != pgid && p->sid == c->sid) return false;
+    }
+    return true;
+}
+
+static bool pgrp_has_stopped_locked(int pgid, const struct tcb *except)
+{
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *c = task_slot(i);
+        if (c != except && proc_alive(c) && c->user && is_leader(c) && c->pgid == pgid && c->signal->stopped)
+            return true;
+    }
+    return false;
+}
+
+static void kill_pgrp_locked(int pgid, int sig, const struct tcb *except)
+{
+    struct ksig_info info = { .code = SI_KERNEL };
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *c = task_slot(i);
+        if (c != except && proc_alive(c) && c->user && is_leader(c) && c->pgid == pgid) send_info_locked(c, sig, &info);
+    }
+}
+
+/* t's process is leaving: a group it kept from being orphaned (its own,
+ * or a child's), now orphaned with a stopped member, gets SIGHUP and
+ * SIGCONT, so stopped jobs of a shell that exits do not linger. */
+static void orphan_check_locked(struct tcb *t)
+{
+    int groups[16], n = 0;
+    groups[n++] = t->pgid;
+    for (int i = 0; i < MAX_TASKS && n < 16; i++) {
+        struct tcb *c = task_slot(i);
+        if (!proc_alive(c) || !c->user || !is_leader(c) || c->ppid != t->tgid || same_group(c, t)) continue;
+        if (c->pgid == t->pgid || c->sid != t->sid) continue;
+        bool seen = false;
+        for (int k = 0; k < n; k++) seen |= groups[k] == c->pgid;
+        if (!seen) groups[n++] = c->pgid;
+    }
+    for (int k = 0; k < n; k++)
+        if (groups[k] > 0 && pgrp_has_stopped_locked(groups[k], t) && pgrp_orphaned_locked(groups[k], t)) {
+            kill_pgrp_locked(groups[k], SIGHUP, t);
+            kill_pgrp_locked(groups[k], SIGCONT, t);
+        }
+}
+
+/* The default action of stop signal sig, taken by thread t. */
+static void group_stop_locked(struct tcb *t, int sig)
+{
+    struct signal_struct *g = t->signal;
+    if (g->stopped || g->group_exit) return;
+    g->stopped = true;
+    g->stop_sig = (uint8_t)sig;
+    g->notify = JOB_NOTIFY_STOPPED;
+    notify_parent_locked(t, CLD_STOPPED, sig);
+    for (int i = 0; i < MAX_TASKS; i++) {               /* the others stop on their way to ring 3 */
+        struct tcb *o = task_slot(i);
+        if (o != t && thread_alive(o) && same_group(o, t)) task_interrupt(o);
+    }
+}
+
+/* Whether thread t is to wait for SIGCONT now. */
+static bool must_stop(const struct tcb *t)
+{
+    const struct signal_struct *g = t->signal;
+    return g->stopped && !g->group_exit && !(t->sig_pending & sigbit(SIGKILL));
+}
+
+int proc_tty_background(int fg_pgrp, int sig)
+{
+    struct tcb *t = current_task();
+    if (!t->user || !fg_pgrp || t->pgid == fg_pgrp) return 0;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    int r;
+    bool skip = t->sighand->action[sig - 1].handler == SIG_IGN || (t->sig_mask & sigbit(sig));
+    if (skip) r = sig == SIGTTIN ? -EIO : 0;            /* a write goes ahead, a read fails */
+    else if (pgrp_orphaned_locked(t->pgid, NULL)) r = -EIO;
+    else {
+        kill_pgrp_locked(t->pgid, sig, NULL);
+        r = -ERESTARTSYS;
+    }
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return r;
+}
+
+bool proc_pgrp_in_session(int pgid, int sid)
+{
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *c = task_slot(i);
+        if (proc_alive(c) && c->user && c->pgid == pgid && c->sid == sid) return true;
+    }
+    return false;
+}
+
 /* proc_lock held from here to signal_send() */
 static int send_thread_locked(struct tcb *t, int sig, const struct ksig_info *info)
 {
     if (!thread_alive(t) || !t->user) return -ESRCH;
     if (sig == 0) return 0;
     if (sig < 1 || sig > NSIG) return -EINVAL;
+    prepare_locked(t, sig);
     if (ignored(t, sig)) return 0;                      /* discarded at generation */
     if (!(t->sig_pending & sigbit(sig)))                /* standard signals do not queue */
         t->siginfo[sig - 1] = info ? *info : (struct ksig_info){ .code = SI_KERNEL };
@@ -792,6 +977,7 @@ static int send_info_locked(struct tcb *t, int sig, const struct ksig_info *info
     if (!proc_alive(t) || !t->user) return -ESRCH;
     if (sig == 0) return 0;
     if (sig < 1 || sig > NSIG) return -EINVAL;
+    prepare_locked(t, sig);
     if (ignored(t, sig)) return 0;
     struct signal_struct *g = t->signal;
     if (sig == SIGKILL) {                               /* every thread, at once */
@@ -883,7 +1069,7 @@ static uint64_t deliverable_of(const struct tcb *t)
 bool signal_pending(void)
 {
     struct tcb *t = current_task();
-    return t->user && deliverable_of(t);
+    return t->user && (deliverable_of(t) || must_stop(t));     /* a stop also ends a wait */
 }
 
 uint64_t signal_pending_mask(void)
@@ -1188,6 +1374,12 @@ void signal_deliver(struct int_frame *f, uint64_t nr, bool syscall)
     struct signal_struct *g = t->signal;
     for (;;) {
         uint64_t fl = spin_lock_irqsave(&proc_lock);    /* taken, with its action, in one go */
+        if (must_stop(t)) {                             /* job control: wait for SIGCONT */
+            t->sig_kick = false;
+            while (must_stop(t)) sleep_on_locked(&g->stopped, &proc_lock);
+            spin_unlock_irqrestore(&proc_lock, fl);
+            continue;
+        }
         uint64_t ready = deliverable_of(t);
         if (!ready) { spin_unlock_irqrestore(&proc_lock, fl); break; }
         int sig = (ready & sigbit(SIGKILL)) ? SIGKILL : __builtin_ctzll(ready) + 1;
@@ -1207,6 +1399,13 @@ void signal_deliver(struct int_frame *f, uint64_t nr, bool syscall)
         spin_unlock_irqrestore(&proc_lock, fl);
         if (sig == SIGKILL || k.handler == SIG_DFL) {
             if (sig != SIGKILL && default_ignored(sig)) continue;
+            if (stop_signal(sig)) {
+                fl = spin_lock_irqsave(&proc_lock);
+                /* SIGTSTP, SIGTTIN and SIGTTOU do nothing to an orphaned group */
+                if (sig == SIGSTOP || !pgrp_orphaned_locked(t->pgid, NULL)) group_stop_locked(t, sig);
+                spin_unlock_irqrestore(&proc_lock, fl);
+                continue;
+            }
             die(t, sig, f->rip, &info);
         }
         if (k.handler == SIG_IGN) continue;
