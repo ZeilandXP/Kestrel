@@ -16,22 +16,30 @@
  * handled by the same parser; their speaker and headphone pins need EAPD,
  * and some keep the headphone amplifier off until the pin's HP bit is set.
  *
- * Playback runs on one output stream descriptor: a ring of 64 KiB in eight
- * buffer descriptor list entries, played over and over. Interrupts stay off;
- * the position comes from the DMA position buffer (or the stream's LPIB
- * register), and a small kernel thread zeroes what has been played so a
+ * Capture takes the first input pin the board wires up (microphone, line
+ * in) with a path to an analog ADC, routed the same way, the pin's input
+ * enabled (with bias voltage for a microphone).
+ *
+ * Playback runs on one output stream descriptor and capture on one input
+ * stream descriptor, each a ring of 64 KiB in eight buffer descriptor list
+ * entries, played (or filled) over and over. Interrupts stay off; the
+ * positions come from the DMA position buffer (or the streams' LPIB
+ * registers), and a small kernel thread zeroes what has been played so a
  * stalled writer plays silence, not the old sound again.
  *
- * Programs get the OSS interface: /dev/dsp (write PCM; S16_LE, U8, S32_LE,
- * mono or stereo, the rates the codec supports) and /dev/mixer (playback
- * volume). The hardware always runs 16-bit stereo; other formats are
- * converted on the way in.
+ * Programs get the OSS interface: /dev/dsp (write and read PCM; S16_LE,
+ * U8, S32_LE, mono or stereo, any rate from 4 to 192 kHz) and /dev/mixer
+ * (playback volume, the recording source). Each open is a client with its
+ * own format and positions: playback clients mix (each adds its samples
+ * into the output ring), capture clients each read the input ring. The
+ * hardware runs 16-bit; other formats and rates are converted.
  *
  * Locking, without the big kernel lock: `slock` (a spinlock) guards the
- * stream and the codec link (the ring accounting, starting and stopping,
- * verbs); `dsp_mutex` serialises /dev/dsp's writers and its ioctls, which
- * share the conversion state and may sleep. The kernel thread lets go of
- * the big lock; writes and polls of /dev/dsp run without it. */
+ * streams, the client table and the codec link (the ring accounting,
+ * starting and stopping, verbs); `dsp_mutex` serialises /dev/dsp's reads,
+ * writes and ioctls, which share the conversion state and may sleep. The
+ * kernel thread lets go of the big lock; reads, writes and polls of
+ * /dev/dsp run without it. */
 #include <kernel/sound.h>
 #include <kernel/vfs.h>
 #include <kernel/task.h>
@@ -103,12 +111,20 @@ enum { W_OUT = 0, W_IN = 1, W_MIXER = 2, W_SELECTOR = 3, W_PIN = 4, W_POWER = 5,
 #define PC_OUT       (1u << 4)
 #define PC_HP_DRIVE  (1u << 3)
 #define PC_PRESENCE  (1u << 2)
+#define PC_IN        (1u << 5)
+#define PC_VREF_50   (1u << 9)
+#define PC_VREF_80   (1u << 12)
+#define PIN_IN_EN    0x20
+#define PIN_VREF_50  0x01
+#define PIN_VREF_80  0x04
+#define WC_STEREO    (1u << 0)
 #define PC_EAPD      (1u << 16)
 #define PIN_OUT_EN   0x40
 #define PIN_HP_EN    0x80
 
 /* configuration default: default device and connectivity */
-enum { DEV_LINE_OUT = 0, DEV_SPEAKER = 1, DEV_HP_OUT = 2, DEV_CD = 3, DEV_SPDIF_OUT = 4, DEV_DIG_OUT = 5 };
+enum { DEV_LINE_OUT = 0, DEV_SPEAKER = 1, DEV_HP_OUT = 2, DEV_CD = 3, DEV_SPDIF_OUT = 4, DEV_DIG_OUT = 5,
+       DEV_LINE_IN = 8, DEV_AUX = 9, DEV_MIC_IN = 10 };
 #define CFG_DEVICE(c)  (((c) >> 20) & 0xf)
 #define CFG_CONN(c)    (((c) >> 30) & 0x3)     /* 0 jack, 1 nothing, 2 fixed (built in), 3 both */
 
@@ -146,20 +162,31 @@ static struct hda {
     uint8_t dacs[MAX_DACS]; int ndacs;
     uint8_t vol_nid[MAX_DACS * 2]; bool vol_out[MAX_DACS * 2]; int nvol;   /* amps the volume control moves */
     char outs[96];
-    /* playback */
-    uint8_t *ring;
-    struct bdl_entry *bdl;
-    int sd;                             /* stream descriptor index */
-    uint8_t tag;
-    bool running, use_lpib;
-    uint32_t last_pos;
-    uint64_t played, written;           /* bytes, since the stream started */
-    uint64_t pos_stuck_since;
-    uint32_t rates;                     /* P_PCM rate bits the DAC supports */
-    uint16_t fmt;                       /* current stream format */
-    int rate;
+    /* capture: an ADC routed from an input pin, if the codec has both */
+    bool cap_ok;
+    uint8_t adc;
+    int rec_mask;                       /* SOUND_MASK_MIC or SOUND_MASK_LINE */
+    char ins[96];
     int volume;                         /* 0..100, both channels */
 } hda;
+
+struct stream {
+    int sd;                             /* stream descriptor index */
+    uint8_t tag;
+    bool input;
+    uint8_t *ring;
+    struct bdl_entry *bdl;
+    bool running, use_lpib;
+    uint32_t last_pos;
+    uint64_t pos, stuck_since;
+    uint64_t written;                   /* output: the furthest any client has written */
+    uint16_t fmt;
+    int rate, ch;                       /* ch: 2, or 1 for a mono ADC */
+    uint32_t rates;                     /* P_PCM rate bits the converters support */
+    uint8_t conv[MAX_DACS];             /* the DACs, or the ADC */
+    int nconv;
+};
+static struct stream out, in;
 
 static uint8_t  r8(uint32_t o)  { return *(volatile uint8_t *)(hda.mm + o); }
 static uint16_t r16(uint32_t o) { return *(volatile uint16_t *)(hda.mm + o); }
@@ -375,7 +402,7 @@ static bool codec_scan(int caddr)
             w->pincaps = param(caddr, n, P_PIN_CAPS);
             w->cfg = verb(n, V_GET_CFG_DEF, 0);
         }
-        if (w->type == W_OUT) {
+        if (w->type == W_OUT || w->type == W_IN) {
             w->pcm = param(caddr, n, P_PCM);
             if (!(w->pcm & 0xfff)) w->pcm = afg_pcm;
         }
@@ -506,10 +533,76 @@ static bool setup_outputs(void)
             snprintf(hda.outs, sizeof hda.outs, "pin 0x%x, DAC 0x%x", nid, path[len - 1]);
         }
     }
-    hda.rates = 0xfff;
-    for (int d = 0; d < hda.ndacs; d++) hda.rates &= hda.w[hda.dacs[d]].pcm & 0xfff;
-    if (!hda.rates) hda.rates = 1u << 6;                /* 48 kHz: every codec has it */
+    out.rates = 0xfff;
+    for (int d = 0; d < hda.ndacs; d++) out.rates &= hda.w[hda.dacs[d]].pcm & 0xfff;
+    if (!out.rates) out.rates = 1u << 6;                /* 48 kHz: every codec has it */
     return hda.ndacs > 0;
+}
+
+/* A path from an ADC up to input pin `want`, through mixers and
+ * selectors: path[0] = ADC ... path[len-1] = the pin. */
+static int find_pin(int nid, uint8_t *path, int depth, int want)
+{
+    if (nid <= 0 || nid >= MAX_NID || depth >= MAX_PATH) return 0;
+    for (int i = 0; i < depth; i++) if (path[i] == nid) return 0;
+    struct widget *w = &hda.w[nid];
+    path[depth] = (uint8_t)nid;
+    if (w->type == W_PIN) return depth && nid == want ? depth + 1 : 0;
+    if (depth ? (w->type != W_MIXER && w->type != W_SELECTOR) : w->type != W_IN) return 0;
+    for (int c = 0; c < w->nconn; c++) {
+        int len = find_pin(w->conn[c], path, depth + 1, want);
+        if (len) return len;
+    }
+    return 0;
+}
+
+/* Capture: the first input pin the board wires up (microphone, then line
+ * in, then anything that takes input) with a path to an analog ADC; the
+ * path is selected and unmuted at 0 dB, the pin's input enabled, with
+ * bias voltage for a microphone. */
+static bool setup_inputs(void)
+{
+    static const int order[] = { DEV_MIC_IN, DEV_LINE_IN, DEV_AUX, -1 };
+    uint8_t path[MAX_PATH];
+    int len = 0, pin = 0;
+    for (int o = 0; o < 4 && !len; o++)
+        for (int nid = 1; nid < MAX_NID && !len; nid++) {
+            struct widget *w = &hda.w[nid];
+            if (w->type != W_PIN || !(w->pincaps & PC_IN)) continue;
+            if (order[o] >= 0 && (CFG_CONN(w->cfg) == 1 || (int)CFG_DEVICE(w->cfg) != order[o])) continue;
+            if (order[o] < 0 && CFG_DEVICE(w->cfg) < DEV_LINE_IN && CFG_DEVICE(w->cfg) != DEV_CD && w->cfg) continue;
+            for (int a = 1; a < MAX_NID && !len; a++)
+                if (hda.w[a].type == W_IN && !(hda.w[a].caps & WC_DIGITAL)) {
+                    len = find_pin(a, path, 0, nid);
+                    if (len) pin = nid;
+                }
+        }
+    if (!len) return false;
+    for (int i = 0; i < len; i++) {
+        int nid = path[i];
+        struct widget *w = &hda.w[nid];
+        int next = i + 1 < len ? path[i + 1] : 0;
+        int idx = next ? conn_index(w, next) : -1;
+        if (idx >= 0 && w->type != W_MIXER && w->nconn > 1) verb(nid, V_SET_CONN_SEL, (uint32_t)idx);
+        if (w->caps & WC_IN_AMP) set_amp(nid, false, idx >= 0 ? idx : 0, amp_0db(w->amp_in), false);
+        if ((w->caps & WC_OUT_AMP) && w->type != W_PIN) set_amp(nid, true, 0, amp_0db(w->amp_out), false);
+    }
+    struct widget *pw = &hda.w[pin];
+    bool mic = CFG_DEVICE(pw->cfg) == DEV_MIC_IN;
+    uint8_t ctl = PIN_IN_EN;
+    if (mic) ctl |= (pw->pincaps & PC_VREF_80) ? PIN_VREF_80 : (pw->pincaps & PC_VREF_50) ? PIN_VREF_50 : 0;
+    verb(pin, V_SET_PIN_CTL, ctl);
+    int adc = path[0];
+    hda.adc = (uint8_t)adc;
+    hda.rec_mask = mic ? (1 << 7) : (1 << 6);           /* SOUND_MASK_MIC, SOUND_MASK_LINE */
+    in.ch = (hda.w[adc].caps & WC_STEREO) ? 2 : 1;
+    in.rates = hda.w[adc].pcm & 0xfff;
+    if (!in.rates) in.rates = 1u << 6;
+    in.conv[0] = (uint8_t)adc;
+    in.nconv = 1;
+    snprintf(hda.ins, sizeof hda.ins, "%s (pin 0x%x, ADC 0x%x, %s)", mic ? "microphone" :
+             CFG_DEVICE(pw->cfg) == DEV_LINE_IN ? "line in" : "input", pin, adc, in.ch == 2 ? "stereo" : "mono");
+    return true;
 }
 
 /* ---- stream format ------------------------------------------------------------------- */
@@ -519,140 +612,116 @@ static const struct { int rate; uint16_t fmt; int bit; } rate_tab[] = {
     {  96000, 0x0800, 8 }, { 176400, 0x5800, 9 }, { 192000, 0x1800, 10 },
 };
 
-/* The supported rate nearest to `want`; its format word (16-bit stereo). */
-static int pick_rate(int want, uint16_t *fmt)
+/* The rate in `rates` (P_PCM bits) nearest to `want`; its format word
+ * (16 bits, `ch` channels). */
+static int pick_rate(uint32_t rates, int want, int ch, uint16_t *fmt)
 {
     int best = -1;
     for (int i = 0; i < (int)(sizeof rate_tab / sizeof *rate_tab); i++) {
-        if (!(hda.rates & (1u << rate_tab[i].bit))) continue;
+        if (!(rates & (1u << rate_tab[i].bit))) continue;
         int d = rate_tab[i].rate - want, bd = best < 0 ? 0 : rate_tab[best].rate - want;
         if (d < 0) d = -d;
         if (bd < 0) bd = -bd;
         if (best < 0 || d < bd) best = i;
     }
     if (best < 0) best = 6;
-    *fmt = (uint16_t)(rate_tab[best].fmt | 0x0010 | 0x0001);   /* 16 bits, 2 channels */
+    *fmt = (uint16_t)(rate_tab[best].fmt | 0x0010 | (uint16_t)(ch - 1));
     return rate_tab[best].rate;
 }
 
-/* ---- the output stream --------------------------------------------------------------- */
-static uint32_t hw_pos(void)
+/* ---- streams ------------------------------------------------------------------------- */
+/* A stream descriptor and its ring of 64 KiB in eight buffer descriptors,
+ * played (output) or filled (input) over and over; `pos` counts the bytes
+ * the hardware has moved since the stream started. The output ring holds
+ * the sum of every client's sound: a client adds its samples at its own
+ * position (mix), and what has been played is zeroed again (update), so
+ * the ring ahead of the hardware is silence wherever no client has written. */
+
+static int hw_frame(const struct stream *s) { return 2 * s->ch; }
+
+static uint32_t hw_pos(struct stream *s)
 {
-    uint32_t lpib = r32(sdreg(hda.sd, SD_LPIB));
-    if (hda.use_lpib || !hda.posbuf) return lpib % RING_BYTES;
-    uint32_t p = hda.posbuf[hda.sd * 2];
+    uint32_t lpib = r32(sdreg(s->sd, SD_LPIB));
+    if (s->use_lpib || !hda.posbuf) return lpib % RING_BYTES;
+    uint32_t p = hda.posbuf[s->sd * 2];
     /* a controller that does not update the position buffer: LPIB instead */
     if (p == 0 && lpib != 0) {
-        if (!hda.pos_stuck_since) hda.pos_stuck_since = time_ms();
-        else if (time_ms() - hda.pos_stuck_since > 50) { hda.use_lpib = true; kprintf("hda: position buffer idle, reading LPIB\n"); }
+        if (!s->stuck_since) s->stuck_since = time_ms();
+        else if (time_ms() - s->stuck_since > 50) {
+            s->use_lpib = true;
+            kprintf("hda: %s: position buffer idle, reading LPIB\n", s->input ? "capture" : "playback");
+        }
         return lpib % RING_BYTES;
     }
-    hda.pos_stuck_since = 0;
+    s->stuck_since = 0;
     return p % RING_BYTES;
 }
 
-static void stream_stop(void)
+static void stream_stop(struct stream *s)
 {
-    if (!hda.running) return;
-    w8(sdreg(hda.sd, SD_CTL), (uint8_t)(r8(sdreg(hda.sd, SD_CTL)) & ~SD_CTL_RUN));
-    wait8(sdreg(hda.sd, SD_CTL), SD_CTL_RUN, 0, 20);
-    hda.running = false;
+    if (!s->running) return;
+    w8(sdreg(s->sd, SD_CTL), (uint8_t)(r8(sdreg(s->sd, SD_CTL)) & ~SD_CTL_RUN));
+    wait8(sdreg(s->sd, SD_CTL), SD_CTL_RUN, 0, 20);
+    s->running = false;
 }
 
-static void stream_start(void)
+static void clients_restarted(struct stream *s);
+
+static void stream_start(struct stream *s)
 {
-    int sd = hda.sd;
-    stream_stop();
+    int sd = s->sd;
+    stream_stop(s);
     w8(sdreg(sd, SD_CTL), SD_CTL_SRST);
     wait8(sdreg(sd, SD_CTL), SD_CTL_SRST, SD_CTL_SRST, 20);
     udelay(10);
     w8(sdreg(sd, SD_CTL), 0);
     wait8(sdreg(sd, SD_CTL), SD_CTL_SRST, 0, 20);
     w8(sdreg(sd, SD_STS), 0x1c);
-    memset(hda.ring, 0, RING_BYTES);
+    memset(s->ring, 0, RING_BYTES);
     if (hda.posbuf) hda.posbuf[sd * 2] = 0;
-    uint64_t b = (uint64_t)(uintptr_t)hda.bdl;
+    uint64_t b = (uint64_t)(uintptr_t)s->bdl;
     w32(sdreg(sd, SD_BDPL), (uint32_t)b);
     w32(sdreg(sd, SD_BDPU), (uint32_t)(b >> 32));
     w32(sdreg(sd, SD_CBL), RING_BYTES);
     w16(sdreg(sd, SD_LVI), BDL_N - 1);
-    w16(sdreg(sd, SD_FMT), hda.fmt);
-    w8(sdreg(sd, SD_CTL) + 2, (uint8_t)(hda.tag << 4));    /* stream number; stripe 0, traffic priority 0 */
-    for (int d = 0; d < hda.ndacs; d++) {
-        verb(hda.dacs[d], V4_SET_FORMAT, hda.fmt);
-        verb(hda.dacs[d], V_SET_STREAM, (uint32_t)hda.tag << 4);   /* channel 0 (and 1) */
+    w16(sdreg(sd, SD_FMT), s->fmt);
+    w8(sdreg(sd, SD_CTL) + 2, (uint8_t)(s->tag << 4));    /* stream number; stripe 0, traffic priority 0 */
+    for (int d = 0; d < s->nconv; d++) {
+        verb(s->conv[d], V4_SET_FORMAT, s->fmt);
+        verb(s->conv[d], V_SET_STREAM, (uint32_t)s->tag << 4);   /* channel 0 (and 1) */
     }
-    hda.last_pos = 0;
-    hda.played = hda.written = 0;
-    hda.pos_stuck_since = 0;
+    s->last_pos = 0;
+    s->pos = s->written = 0;
+    s->stuck_since = 0;
+    clients_restarted(s);
     w8(sdreg(sd, SD_CTL), SD_CTL_RUN);
-    hda.running = true;
+    s->running = true;
 }
 
-/* Account for what the hardware has played since the last look, and zero it. */
-static void update(void)
+/* Account for what the hardware has moved since the last look; on output,
+ * zero what has been played. */
+static void update(struct stream *s)
 {
-    if (!hda.running) return;
-    uint32_t pos = hw_pos();
-    uint32_t d = (pos + RING_BYTES - hda.last_pos) % RING_BYTES;
+    if (!s->running) return;
+    uint32_t p = hw_pos(s);
+    uint32_t d = (p + RING_BYTES - s->last_pos) % RING_BYTES;
     if (!d) return;
-    uint32_t a = hda.last_pos;
-    for (uint32_t left = d; left; ) {
-        uint32_t n = RING_BYTES - a < left ? RING_BYTES - a : left;
-        memset(hda.ring + a, 0, n);
-        a = (a + n) % RING_BYTES;
-        left -= n;
-    }
-    hda.last_pos = pos;
-    hda.played += d;
-    if (hda.written < hda.played) hda.written = hda.played;     /* ran dry: carry on from here */
+    if (!s->input)
+        for (uint32_t a = s->last_pos, left = d; left; ) {
+            uint32_t n = RING_BYTES - a < left ? RING_BYTES - a : left;
+            memset(s->ring + a, 0, n);
+            a = (a + n) % RING_BYTES;
+            left -= n;
+        }
+    s->last_pos = p;
+    s->pos += d;
+    if (!s->input && s->written < s->pos) s->written = s->pos;  /* ran dry: carry on from here */
 }
 
-static uint32_t queued(void) { return (uint32_t)(hda.written - hda.played); }
+static uint32_t out_queued(void) { return (uint32_t)(out.written - out.pos); }
 
 #define LEAD    256u                    /* never write closer than this to the DMA engine */
 #define GUARD   4096u                   /* never fill the ring completely */
-static uint32_t space(void) { uint32_t q = queued(); return q + GUARD >= RING_BYTES ? 0 : RING_BYTES - GUARD - q; }
-
-/* Copy 16-bit stereo frames into the ring at the write position. */
-static void put_frames(const int16_t *src, uint32_t bytes)
-{
-    if (queued() < LEAD) hda.written = hda.played + LEAD;        /* just after the DMA engine */
-    uint32_t at = (uint32_t)(hda.written % RING_BYTES);
-    const uint8_t *s = (const uint8_t *)src;
-    for (uint32_t left = bytes; left; ) {
-        uint32_t n = RING_BYTES - at < left ? RING_BYTES - at : left;
-        memcpy(hda.ring + at, s, n);
-        s += n;
-        at = (at + n) % RING_BYTES;
-        left -= n;
-    }
-    hda.written += bytes;
-}
-
-/* The kernel thread: keeps the accounting going (and the played part silent)
- * while the stream runs; stops the stream a while after it has run dry. */
-static int dsp_open_count;
-static int hdad_main(void *arg)
-{
-    (void)arg;
-    uint64_t dry_since = 0;
-    bkl_release_all();                                  /* slock is all it needs */
-    for (;;) {
-        uint64_t fl = spin_lock_irqsave(&slock);
-        if (hda.running) {
-            update();
-            if (!queued() && !dsp_open_count) {
-                if (!dry_since) dry_since = time_ms();
-                else if (time_ms() - dry_since > 1000) { stream_stop(); dry_since = 0; }
-            } else dry_since = 0;
-            wakeup(&hda);
-        }
-        spin_unlock_irqrestore(&slock, fl);
-        task_sleep_ms(hda.running ? 4 : 50);
-    }
-    return 0;
-}
 
 /* ---- volume ------------------------------------------------------------------------------ */
 static void set_volume(int v)
@@ -672,137 +741,257 @@ static void set_volume(int v)
     spin_unlock_irqrestore(&slock, fl);
 }
 
-/* ---- /dev/dsp ---------------------------------------------------------------------------- */
+/* ---- /dev/dsp ---------------------------------------------------------------------------- *
+ * Every open of /dev/dsp is a client with its own format, rate and
+ * positions (up to MAX_CLIENTS at once). Playback clients mix: each adds
+ * its samples into the output ring at its own write position, ahead of the
+ * hardware, saturating at the 16-bit limits. Capture clients each read the
+ * input ring from their own position. The hardware runs at one rate per
+ * direction: a client alone in its direction gets the codec running at its
+ * rate when the codec has it (as before mixing); others are converted to
+ * and from the rate the stream already runs at (linear interpolation). */
 #define AFMT_U8      0x00000008
 #define AFMT_S16_LE  0x00000010
 #define AFMT_S32_LE  0x00001000
 #define FRAG_BYTES   4096
+#define MAX_CLIENTS  8
 
-static struct {
-    int fmt, channels, rate;            /* what the program writes */
+/* A rate converter: `step` input frames per output frame in 16.16. */
+struct conv { bool on; uint32_t step, phase; int16_t prev[2]; };
+
+struct client {
+    struct file *f;                     /* NULL: a free slot */
+    bool play, rec;
+    int fmt, channels, rate;            /* what the program writes and reads */
+    int trigger;                        /* PCM_ENABLE_INPUT (1) | PCM_ENABLE_OUTPUT (2) */
+    /* playback */
     uint8_t carry[8]; int ncarry;       /* a partial frame from the last write */
-    /* rate conversion (when the codec cannot run at `rate`): linear
-     * interpolation, `step` input frames per output frame in 16.16 */
-    bool resample;
-    uint32_t step, phase;
-    int16_t prev[2];
-} dsp;
+    struct conv wc;                     /* its rate -> the output stream's */
+    uint64_t wpos, wtotal;              /* next byte in the output ring's time; bytes put */
+    /* capture */
+    struct conv rc;                     /* the input stream's rate -> its rate */
+    uint64_t rpos, rtotal;              /* next byte of the input ring; bytes delivered */
+    uint64_t overruns;
+    uint8_t pend[512]; int npend, pend_off;     /* converted frames a read had no room for */
+};
+static struct client clients[MAX_CLIENTS];
+static int nplay, nrec;                 /* clients of each direction (slock) */
 
-static int in_frame_bytes(void) { return (dsp.fmt == AFMT_U8 ? 1 : dsp.fmt == AFMT_S32_LE ? 4 : 2) * dsp.channels; }
+static int frame_bytes(const struct client *c) { return (c->fmt == AFMT_U8 ? 1 : c->fmt == AFMT_S32_LE ? 4 : 2) * c->channels; }
 
-static int16_t sample_at(const uint8_t *p, int ch)
+static int16_t sample_at(const struct client *c, const uint8_t *p, int ch)
 {
-    switch (dsp.fmt) {
+    switch (c->fmt) {
     case AFMT_U8: return (int16_t)(((int)p[ch] - 128) << 8);
     case AFMT_S32_LE: { int32_t v; memcpy(&v, p + 4 * ch, 4); return (int16_t)(v >> 16); }
     default: { int16_t v; memcpy(&v, p + 2 * ch, 2); return v; }
     }
 }
 
-/* `frames` input frames into 16-bit stereo; returns the output frame count
- * (at most `cap`; the caller passes few enough input frames). */
-static int convert(const uint8_t *in, int frames, int16_t *out, int cap)
+static void sample_put(const struct client *c, uint8_t *p, int ch, int16_t v)
 {
-    int fb = in_frame_bytes(), n = 0;
-    for (int i = 0; i < frames; i++, in += fb) {
-        int16_t l = sample_at(in, 0), r = dsp.channels > 1 ? sample_at(in, 1) : l;
-        if (!dsp.resample) { out[2 * n] = l; out[2 * n + 1] = r; n++; continue; }
-        while (dsp.phase < 0x10000 && n < cap) {
-            int32_t f = (int32_t)dsp.phase;
-            out[2 * n] = (int16_t)(dsp.prev[0] + (((int32_t)l - dsp.prev[0]) * f >> 16));
-            out[2 * n + 1] = (int16_t)(dsp.prev[1] + (((int32_t)r - dsp.prev[1]) * f >> 16));
-            n++;
-            dsp.phase += dsp.step;
-        }
-        dsp.phase -= 0x10000;
-        dsp.prev[0] = l;
-        dsp.prev[1] = r;
+    switch (c->fmt) {
+    case AFMT_U8: p[ch] = (uint8_t)((v >> 8) + 128); break;
+    case AFMT_S32_LE: { int32_t x = (int32_t)v * 65536; memcpy(p + 4 * ch, &x, 4); break; }
+    default: memcpy(p + 2 * ch, &v, 2); break;
     }
+}
+
+static void conv_set(struct conv *cv, int from, int to)
+{
+    cv->on = from != to;
+    cv->step = (uint32_t)(((uint64_t)from << 16) / (uint64_t)to);
+    cv->phase = 0;
+    cv->prev[0] = cv->prev[1] = 0;
+}
+
+/* One input frame through the converter: the output frames it completes
+ * (up to 49: rates differ by at most 48 times) into o. */
+static int conv1(struct conv *cv, int16_t l, int16_t r, int16_t *o)
+{
+    if (!cv->on) { o[0] = l; o[1] = r; return 1; }
+    int n = 0;
+    while (cv->phase < 0x10000) {
+        int32_t f = (int32_t)cv->phase;
+        o[2 * n] = (int16_t)(cv->prev[0] + (((int32_t)l - cv->prev[0]) * f >> 16));
+        o[2 * n + 1] = (int16_t)(cv->prev[1] + (((int32_t)r - cv->prev[1]) * f >> 16));
+        n++;
+        cv->phase += cv->step;
+    }
+    cv->phase -= 0x10000;
+    cv->prev[0] = l;
+    cv->prev[1] = r;
     return n;
 }
 
-/* Output bytes (16-bit stereo at the hardware rate) as bytes of the program's format. */
-static int to_in_bytes(uint64_t out)
+/* Output-ring bytes as bytes of the client's format, and input-ring bytes likewise. */
+static int out_to_client(const struct client *c, uint64_t bytes)
 {
-    uint64_t frames = out / 4;
-    if (dsp.resample) frames = frames * (uint64_t)dsp.rate / (uint64_t)hda.rate;
-    return (int)(frames * (uint64_t)in_frame_bytes());
+    uint64_t frames = bytes / 4;
+    if (c->wc.on) frames = frames * (uint64_t)c->rate / (uint64_t)out.rate;
+    return (int)(frames * (uint64_t)frame_bytes(c));
+}
+static int in_to_client(const struct client *c, uint64_t bytes)
+{
+    uint64_t frames = bytes / (uint64_t)hw_frame(&in);
+    if (c->rc.on) frames = frames * (uint64_t)c->rate / (uint64_t)in.rate;
+    return (int)(frames * (uint64_t)frame_bytes(c));
 }
 
-/* The hardware runs at the program's rate when the codec has it, else at
- * 48 kHz (or the nearest it has) with the driver converting. */
-static void dsp_apply_rate(void)
+/* slock held. A stream (re)started: positions count from 0 again. */
+static void clients_restarted(struct stream *s)
 {
-    uint16_t fmt;
-    int hw = pick_rate(dsp.rate, &fmt);
-    if (hw != dsp.rate) hw = pick_rate(48000, &fmt);
-    dsp.resample = hw != dsp.rate;
-    dsp.step = (uint32_t)(((uint64_t)dsp.rate << 16) / (uint64_t)hw);
-    dsp.phase = 0;
-    dsp.prev[0] = dsp.prev[1] = 0;
-    if (fmt != hda.fmt || hda.rate != hw) {
-        uint64_t fl = spin_lock_irqsave(&slock);
-        bool was = hda.running;
-        stream_stop();
-        hda.fmt = fmt;
-        hda.rate = hw;
-        if (was) stream_start();
-        spin_unlock_irqrestore(&slock, fl);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].f) continue;
+        if (s == &out) clients[i].wpos = 0;
+        else clients[i].rpos = 0;
     }
 }
 
-static int dsp_open(struct vnode *vn, int flags, struct file **out)
+static uint32_t c_queued(const struct client *c) { return c->wpos > out.pos ? (uint32_t)(c->wpos - out.pos) : 0; }
+static uint32_t c_space(const struct client *c)
 {
-    if ((flags & O_ACCMODE) == O_RDONLY) return -ENODEV;   /* no capture yet */
-    if (dsp_open_count) return -EBUSY;
+    uint32_t q = c_queued(c);
+    return q + GUARD >= RING_BYTES ? 0 : RING_BYTES - GUARD - q;
+}
+
+/* slock held, input updated: input bytes waiting for the client (an
+ * overrun first moves it to the oldest data still safe to read). */
+static uint32_t c_avail(struct client *c)
+{
+    if (!in.running) return 0;
+    if (c->rpos > in.pos) c->rpos = in.pos;
+    if (in.pos - c->rpos > RING_BYTES - GUARD) { c->rpos = in.pos - (RING_BYTES - GUARD); c->overruns++; }
+    return (uint32_t)(in.pos - c->rpos);
+}
+
+/* slock held. Add 16-bit stereo frames into the output ring at the
+ * client's position. */
+static void mix(struct client *c, const int16_t *src, uint32_t bytes)
+{
+    if (c_queued(c) < LEAD) c->wpos = out.pos + LEAD;   /* just after the DMA engine */
+    int16_t *ring = (int16_t *)out.ring;
+    uint32_t at = (uint32_t)(c->wpos % RING_BYTES) / 2, n = bytes / 2;
+    for (uint32_t i = 0; i < n; i++) {
+        int32_t v = (int32_t)ring[at] + src[i];
+        ring[at] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+        if (++at == RING_BYTES / 2) at = 0;
+    }
+    c->wpos += bytes;
+    c->wtotal += bytes;
+    if (c->wpos > out.written) out.written = c->wpos;
+}
+
+/* dsp_mutex held. The rates of the client's directions: the hardware
+ * follows a client alone in its direction when the codec has its rate. */
+static void apply_rates(struct client *c)
+{
+    struct stream *ss[2] = { c->play ? &out : NULL, c->rec ? &in : NULL };
+    for (int k = 0; k < 2; k++) {
+        struct stream *s = ss[k];
+        if (!s) continue;
+        uint64_t fl = spin_lock_irqsave(&slock);
+        if ((s == &out ? nplay : nrec) == 1) {
+            uint16_t fmt;
+            int hw = pick_rate(s->rates, c->rate, s->ch, &fmt);
+            if (hw != c->rate) hw = pick_rate(s->rates, 48000, s->ch, &fmt);
+            if (fmt != s->fmt || hw != s->rate) {
+                bool was = s->running;
+                stream_stop(s);
+                s->fmt = fmt;
+                s->rate = hw;
+                if (was) stream_start(s);
+            }
+        }
+        spin_unlock_irqrestore(&slock, fl);
+        if (s == &out) conv_set(&c->wc, c->rate, out.rate);
+        else conv_set(&c->rc, in.rate, c->rate);
+    }
+}
+
+static struct client *client_of(struct file *f)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++) if (clients[i].f == f) return &clients[i];
+    return NULL;
+}
+
+static int dsp_open(struct vnode *vn, int flags, struct file **outf)
+{
+    int acc = flags & O_ACCMODE;
+    if (acc == O_RDONLY && !hda.cap_ok) return -ENODEV;    /* no input on this codec */
+    kmutex_lock(&dsp_mutex);
+    struct client *c = client_of(NULL);
+    if (!c) { kmutex_unlock(&dsp_mutex); return -EBUSY; }
     struct file *f = vfs_file_new(vn, flags);
-    if (!f) return -ENOMEM;
-    dsp_open_count++;
-    dsp.fmt = AFMT_U8;                                  /* the OSS defaults */
-    dsp.channels = 1;
-    dsp.rate = 8000;
-    dsp.ncarry = 0;
-    dsp_apply_rate();
-    *out = f;
+    if (!f) { kmutex_unlock(&dsp_mutex); return -ENOMEM; }
+    memset(c, 0, sizeof *c);
+    c->fmt = AFMT_U8;                                   /* the OSS defaults */
+    c->channels = 1;
+    c->rate = 8000;
+    c->play = acc != O_RDONLY;
+    c->rec = acc != O_WRONLY && hda.cap_ok;
+    c->trigger = (c->rec ? 1 : 0) | (c->play ? 2 : 0);
+    uint64_t fl = spin_lock_irqsave(&slock);
+    c->f = f;
+    nplay += c->play;
+    nrec += c->rec;
+    spin_unlock_irqrestore(&slock, fl);
+    apply_rates(c);
+    if (c->rec) {
+        fl = spin_lock_irqsave(&slock);
+        if (!in.running) stream_start(&in);
+        update(&in);
+        c->rpos = in.pos;                               /* from now on */
+        spin_unlock_irqrestore(&slock, fl);
+    }
+    kmutex_unlock(&dsp_mutex);
+    *outf = f;
     return 0;
 }
 
 static void dsp_release(struct file *f)
 {
-    (void)f;
-    dsp_open_count--;
-}
-
-/* write: convert, wait for room (unless O_NONBLOCK), copy into the ring. */
-/* write: convert, wait for room (unless O_NONBLOCK), copy into the ring.
- * Room means a fragment, or all of a smaller write: a nonblocking writer
- * gets EAGAIN instead of a trickle of tiny writes. */
-static ssize_t dsp_write_locked(struct file *f, const void *buf, size_t len);
-
-static ssize_t dsp_fwrite(struct file *f, const void *buf, size_t len)
-{
-    if (!hda.ready) return -EIO;
     kmutex_lock(&dsp_mutex);
-    ssize_t r = dsp_write_locked(f, buf, len);
+    struct client *c = client_of(f);
+    if (c) {
+        uint64_t fl = spin_lock_irqsave(&slock);
+        nplay -= c->play;
+        nrec -= c->rec;
+        c->f = NULL;
+        spin_unlock_irqrestore(&slock, fl);
+    }
     kmutex_unlock(&dsp_mutex);
-    return r;
 }
 
-static ssize_t dsp_write_locked(struct file *f, const void *buf, size_t len)
+/* `frames` of the client's frames into 16-bit stereo at the output rate. */
+static int convert_out(struct client *c, const uint8_t *src, int frames, int16_t *o)
+{
+    int fb = frame_bytes(c), n = 0;
+    for (int i = 0; i < frames; i++, src += fb) {
+        int16_t l = sample_at(c, src, 0), r = c->channels > 1 ? sample_at(c, src, 1) : l;
+        n += conv1(&c->wc, l, r, o + 2 * n);
+    }
+    return n;
+}
+
+/* write: convert, wait for room (unless O_NONBLOCK), mix into the ring.
+ * Room means a fragment, or all of a smaller write: a nonblocking writer
+ * gets EAGAIN instead of a trickle of tiny writes. dsp_mutex held. */
+static ssize_t dsp_write_locked(struct client *c, struct file *f, const void *buf, size_t len)
 {
     const uint8_t *p = buf;
     size_t done = 0;
-    int fb = in_frame_bytes();
-    static int16_t tmp[2 * 2048];
+    int fb = frame_bytes(c);
+    static int16_t tmp[2 * (2048 + 64)];
     const int cap = 2048;
     while (done < len) {
         uint64_t fl = spin_lock_irqsave(&slock);
-        if (!hda.running) stream_start();
-        update();
-        uint32_t room = space();
+        if (!out.running) stream_start(&out);
+        update(&out);
+        uint32_t room = c_space(c);
         spin_unlock_irqrestore(&slock, fl);
         uint64_t want = (uint64_t)(len - done) / (uint64_t)fb * 4;          /* output bytes, about */
-        if (dsp.resample) want = want * (uint64_t)hda.rate / (uint64_t)dsp.rate + 8;
+        if (c->wc.on) want = want * (uint64_t)out.rate / (uint64_t)c->rate + 8;
         uint32_t need = want < FRAG_BYTES ? (uint32_t)want : FRAG_BYTES;
         if (need < 8 || done) need = 8;                 /* once started, fill what fits */
         if (room < need) {
@@ -812,148 +1001,307 @@ static ssize_t dsp_write_locked(struct file *f, const void *buf, size_t len)
             kmutex_unlock(&dsp_mutex);                  /* ioctls (GETODELAY...) go on meanwhile */
             task_sleep_ms(4);
             kmutex_lock(&dsp_mutex);
+            if (client_of(f) != c) return -EBADF;
             continue;
         }
-        /* a partial frame left over from the last call first */
-        if (dsp.ncarry) {
-            while (dsp.ncarry < fb && done < len) dsp.carry[dsp.ncarry++] = p[done++];
-            if (dsp.ncarry < fb) break;
-            int n = convert(dsp.carry, 1, tmp, cap);
-            fl = spin_lock_irqsave(&slock); put_frames(tmp, (uint32_t)n * 4); spin_unlock_irqrestore(&slock, fl);
-            dsp.ncarry = 0;
+        if (c->ncarry) {                                /* a partial frame left from the last call first */
+            while (c->ncarry < fb && done < len) c->carry[c->ncarry++] = p[done++];
+            if (c->ncarry < fb) break;
+            int n = convert_out(c, c->carry, 1, tmp);
+            fl = spin_lock_irqsave(&slock); mix(c, tmp, (uint32_t)n * 4); spin_unlock_irqrestore(&slock, fl);
+            c->ncarry = 0;
             continue;
         }
         size_t frames = (len - done) / (size_t)fb;
         if (!frames) {                                  /* keep the tail for next time */
-            while (done < len) dsp.carry[dsp.ncarry++] = p[done++];
+            while (done < len) c->carry[c->ncarry++] = p[done++];
             break;
         }
         uint64_t out_room = room / 4 < (uint32_t)cap ? room / 4 : (uint32_t)cap;   /* output frames */
-        uint64_t max = dsp.resample ? out_room * (uint64_t)dsp.rate / (uint64_t)hda.rate : out_room;
-        if (dsp.resample && max > 1) max -= 1;          /* rounding: never more output than room */
+        uint64_t max = c->wc.on ? out_room * (uint64_t)c->rate / (uint64_t)out.rate : out_room;
+        if (c->wc.on && max > 1) max -= 1;              /* rounding: never more output than room */
         if (!max) max = 1;
         if (frames > max) frames = max;
-        int n = convert(p + done, (int)frames, tmp, cap);
+        int n = convert_out(c, p + done, (int)frames, tmp);
         fl = spin_lock_irqsave(&slock);
-        put_frames(tmp, (uint32_t)n * 4);
+        mix(c, tmp, (uint32_t)n * 4);
         spin_unlock_irqrestore(&slock, fl);
         done += frames * (size_t)fb;
     }
     return (ssize_t)done;
 }
 
-static int dsp_poll(struct file *f, int events)
+static ssize_t dsp_fwrite(struct file *f, const void *buf, size_t len)
 {
-    (void)f;
-    poll_wait(&hda);                                    /* and the 4 ms poll deadline */
-    uint64_t fl = spin_lock_irqsave(&slock);
-    update();
-    int r = (hda.ready && space() >= FRAG_BYTES) ? (events & (POLLOUT | POLLWRNORM)) : 0;
-    spin_unlock_irqrestore(&slock, fl);
-    return r;
-}
-
-static uint64_t dsp_poll_deadline(struct file *f) { (void)f; return __atomic_load_n(&hda.running, __ATOMIC_RELAXED) ? time_ms() + 4 : 0; }
-
-
-static int put_int(void *arg, int v) { return copy_to_user(arg, &v, sizeof v) ? -EFAULT : 0; }
-static int get_int(void *arg, int *v) { return copy_from_user(v, arg, sizeof *v) ? -EFAULT : 0; }
-
-static int dsp_ioctl_locked(struct file *f, unsigned long req, void *arg);
-
-static int dsp_ioctl(struct file *f, unsigned long req, void *arg)
-{
+    if (!hda.ready) return -EIO;
     kmutex_lock(&dsp_mutex);
-    int r = dsp_ioctl_locked(f, req, arg);
+    struct client *c = client_of(f);
+    ssize_t r = !c ? -EBADF : !c->play ? -EBADF : dsp_write_locked(c, f, buf, len);
     kmutex_unlock(&dsp_mutex);
     return r;
 }
 
-static int dsp_ioctl_locked(struct file *f, unsigned long req, void *arg)
+/* read: what the input ring holds since the client's position, converted
+ * to its format; blocks until all of `len` is there (unless O_NONBLOCK, or
+ * a signal after some of it), as OSS reads do. dsp_mutex held. */
+static ssize_t dsp_read_locked(struct client *c, struct file *f, void *buf, size_t len)
+{
+    uint8_t *p = buf;
+    size_t done = 0;
+    int fb = frame_bytes(c), hwfb = hw_frame(&in);
+    static uint8_t obuf[4096 + 512];
+    static int16_t fr[2 * 64];
+    while (done < len) {
+        if (c->pend_off < c->npend) {                   /* converted before, not yet taken */
+            size_t n = (size_t)(c->npend - c->pend_off) < len - done ? (size_t)(c->npend - c->pend_off) : len - done;
+            memcpy(p + done, c->pend + c->pend_off, n);
+            c->pend_off += (int)n;
+            done += n;
+            continue;
+        }
+        uint64_t fl = spin_lock_irqsave(&slock);
+        update(&in);
+        uint32_t avail = c_avail(c);
+        spin_unlock_irqrestore(&slock, fl);
+        if (avail < (uint32_t)hwfb) {
+            if (f->flags & O_NONBLOCK) return done ? (ssize_t)done : -EAGAIN;
+            if (signal_pending()) return done ? (ssize_t)done : -ERESTARTSYS;
+            kmutex_unlock(&dsp_mutex);
+            task_sleep_ms(4);
+            kmutex_lock(&dsp_mutex);
+            if (client_of(f) != c) return done ? (ssize_t)done : -EBADF;
+            continue;
+        }
+        /* hardware frames, one at a time from the ring (the DMA engine stays
+         * at least GUARD bytes away), until enough output for the request */
+        size_t want = (len - done + (size_t)fb - 1) / (size_t)fb, made = 0, limit = 4096 / (size_t)fb;
+        if (want > limit) want = limit;
+        while (avail >= (uint32_t)hwfb && made < want) {
+            const uint8_t *src = in.ring + c->rpos % RING_BYTES;
+            int16_t l, r;
+            memcpy(&l, src, 2);
+            if (in.ch > 1) memcpy(&r, src + 2, 2); else r = l;
+            c->rpos += (uint64_t)hwfb;
+            avail -= (uint32_t)hwfb;
+            int n = conv1(&c->rc, l, r, fr);
+            for (int k = 0; k < n; k++, made++) {
+                uint8_t *o = obuf + made * (size_t)fb;
+                if (c->channels > 1) { sample_put(c, o, 0, fr[2 * k]); sample_put(c, o, 1, fr[2 * k + 1]); }
+                else sample_put(c, o, 0, (int16_t)(((int32_t)fr[2 * k] + fr[2 * k + 1]) / 2));
+            }
+        }
+        size_t bytes = made * (size_t)fb, n = bytes < len - done ? bytes : len - done;
+        memcpy(p + done, obuf, n);
+        done += n;
+        c->rtotal += bytes;
+        if (n < bytes) {                                /* the rest of the last frames, for next time */
+            c->npend = (int)(bytes - n);
+            c->pend_off = 0;
+            memcpy(c->pend, obuf + n, (size_t)c->npend);
+        }
+    }
+    return (ssize_t)done;
+}
+
+static ssize_t dsp_fread(struct file *f, void *buf, size_t len)
+{
+    if (!hda.ready) return -EIO;
+    kmutex_lock(&dsp_mutex);
+    struct client *c = client_of(f);
+    ssize_t r = !c || !c->rec ? -EBADF : dsp_read_locked(c, f, buf, len);
+    kmutex_unlock(&dsp_mutex);
+    return r;
+}
+
+static int dsp_poll(struct file *f, int events)
+{
+    poll_wait(&hda);                                    /* and the 4 ms poll deadline */
+    int r = 0;
+    uint64_t fl = spin_lock_irqsave(&slock);
+    struct client *c = client_of(f);
+    if (c && hda.ready) {
+        if (c->play) { update(&out); if (c_space(c) >= FRAG_BYTES) r |= events & (POLLOUT | POLLWRNORM); }
+        if (c->rec) {
+            update(&in);
+            if (c->pend_off < c->npend || c_avail(c) >= FRAG_BYTES) r |= events & (POLLIN | POLLRDNORM);
+        }
+    }
+    spin_unlock_irqrestore(&slock, fl);
+    return r;
+}
+
+static uint64_t dsp_poll_deadline(struct file *f)
+{
+    (void)f;
+    bool on = __atomic_load_n(&out.running, __ATOMIC_RELAXED) || __atomic_load_n(&in.running, __ATOMIC_RELAXED);
+    return on ? time_ms() + 4 : 0;
+}
+
+/* The kernel thread: keeps the accounting going (and the played part
+ * silent) while streams run; stops the output a while after it has run dry
+ * with no client left, and the input when nobody reads. */
+static int hdad_main(void *arg)
+{
+    (void)arg;
+    uint64_t dry_since = 0;
+    bkl_release_all();                                  /* slock is all it needs */
+    for (;;) {
+        uint64_t fl = spin_lock_irqsave(&slock);
+        if (out.running) {
+            update(&out);
+            if (!out_queued() && !nplay) {
+                if (!dry_since) dry_since = time_ms();
+                else if (time_ms() - dry_since > 1000) { stream_stop(&out); dry_since = 0; }
+            } else dry_since = 0;
+        }
+        if (in.running) {
+            update(&in);
+            if (!nrec) stream_stop(&in);
+        }
+        if (out.running || in.running) wakeup(&hda);
+        bool on = out.running || in.running;
+        spin_unlock_irqrestore(&slock, fl);
+        task_sleep_ms(on ? 4 : 50);
+    }
+    return 0;
+}
+
+static int put_int(void *arg, int v) { return copy_to_user(arg, &v, sizeof v) ? -EFAULT : 0; }
+static int get_int(void *arg, int *v) { return copy_from_user(v, arg, sizeof *v) ? -EFAULT : 0; }
+
+static int dsp_ioctl_locked(struct client *c, struct file *f, unsigned long req, void *arg);
+
+static int dsp_ioctl(struct file *f, unsigned long req, void *arg)
+{
+    kmutex_lock(&dsp_mutex);
+    struct client *c = client_of(f);
+    int r = c ? dsp_ioctl_locked(c, f, req, arg) : -EBADF;
+    kmutex_unlock(&dsp_mutex);
+    return r;
+}
+
+static int dsp_ioctl_locked(struct client *c, struct file *f, unsigned long req, void *arg)
 {
     int v, r;
     switch ((uint32_t)req) {
     case 0x5000:                                        /* SNDCTL_DSP_RESET */
     case 0x5008: {                                      /* SNDCTL_DSP_POST */
         uint64_t fl = spin_lock_irqsave(&slock);
-        if (req == 0x5000 && hda.running) { update(); hda.written = hda.played; memset(hda.ring, 0, RING_BYTES); }
+        if (req == 0x5000) {
+            if (c->play && out.running) {
+                update(&out);
+                /* alone, its queued sound goes too; mixed with others it is in their sum */
+                if (nplay == 1) {
+                    memset(out.ring, 0, RING_BYTES);
+                    out.written = out.pos;
+                }
+                c->wpos = out.pos;
+            }
+            if (c->rec) { update(&in); c->rpos = in.pos; c->npend = c->pend_off = 0; }
+        }
         spin_unlock_irqrestore(&slock, fl);
-        dsp.ncarry = 0;
+        c->ncarry = 0;
         return 0;
     }
-    case 0x5001:                                        /* SNDCTL_DSP_SYNC: until played */
+    case 0x5001:                                        /* SNDCTL_DSP_SYNC: until its sound has played */
         for (;;) {
             uint64_t fl = spin_lock_irqsave(&slock);
-            update();
-            uint32_t q = hda.running ? queued() : 0;
+            update(&out);
+            uint32_t q = c->play && out.running ? c_queued(c) : 0;
             spin_unlock_irqrestore(&slock, fl);
             if (!q) return 0;
             if (signal_pending()) return -ERESTARTSYS;
             kmutex_unlock(&dsp_mutex);
             task_sleep_ms(4);
             kmutex_lock(&dsp_mutex);
+            if (client_of(f) != c) return -EBADF;
         }
     case 0xC0045002:                                    /* SNDCTL_DSP_SPEED */
         if ((r = get_int(arg, &v))) return r;
         if (v <= 0) return -EINVAL;
         if (v < 4000) v = 4000;
         if (v > 192000) v = 192000;
-        dsp.rate = v;
-        dsp_apply_rate();
-        return put_int(arg, dsp.rate);
+        c->rate = v;
+        apply_rates(c);
+        return put_int(arg, c->rate);
     case 0x80045002:                                    /* SOUND_PCM_READ_RATE */
-        return put_int(arg, dsp.rate);
+        return put_int(arg, c->rate);
     case 0xC0045003:                                    /* SNDCTL_DSP_STEREO */
         if ((r = get_int(arg, &v))) return r;
-        dsp.channels = v ? 2 : 1;
-        return put_int(arg, dsp.channels - 1);
+        c->channels = v ? 2 : 1;
+        c->ncarry = c->npend = c->pend_off = 0;
+        return put_int(arg, c->channels - 1);
     case 0xC0045004:                                    /* SNDCTL_DSP_GETBLKSIZE */
-        return put_int(arg, to_in_bytes(FRAG_BYTES));
+        return put_int(arg, c->play ? out_to_client(c, FRAG_BYTES) : in_to_client(c, FRAG_BYTES));
     case 0xC0045005:                                    /* SNDCTL_DSP_SETFMT */
         if ((r = get_int(arg, &v))) return r;
-        if (v == AFMT_U8 || v == AFMT_S16_LE || v == AFMT_S32_LE) { dsp.fmt = v; dsp.ncarry = 0; }
-        return put_int(arg, dsp.fmt);                   /* 0 (AFMT_QUERY) or unknown: the current one */
+        if (v == AFMT_U8 || v == AFMT_S16_LE || v == AFMT_S32_LE) { c->fmt = v; c->ncarry = c->npend = c->pend_off = 0; }
+        return put_int(arg, c->fmt);                    /* 0 (AFMT_QUERY) or unknown: the current one */
     case 0xC0045006:                                    /* SNDCTL_DSP_CHANNELS */
         if ((r = get_int(arg, &v))) return r;
-        dsp.channels = v >= 2 ? 2 : 1;
-        dsp.ncarry = 0;
-        return put_int(arg, dsp.channels);
+        c->channels = v >= 2 ? 2 : 1;
+        c->ncarry = c->npend = c->pend_off = 0;
+        return put_int(arg, c->channels);
     case 0x80045006:                                    /* SOUND_PCM_READ_CHANNELS */
-        return put_int(arg, dsp.channels);
+        return put_int(arg, c->channels);
     case 0xC0045009:                                    /* SNDCTL_DSP_SUBDIVIDE */
     case 0xC004500A:                                    /* SNDCTL_DSP_SETFRAGMENT: fixed fragments */
         return 0;
     case 0x8004500B:                                    /* SNDCTL_DSP_GETFMTS */
         return put_int(arg, AFMT_U8 | AFMT_S16_LE | AFMT_S32_LE);
     case 0x8010500C: {                                  /* SNDCTL_DSP_GETOSPACE */
+        if (!c->play) return -EINVAL;
         uint64_t fl = spin_lock_irqsave(&slock);
-        update();
-        uint32_t room = hda.running ? space() : RING_BYTES - GUARD;
+        update(&out);
+        uint32_t room = out.running ? c_space(c) : RING_BYTES - GUARD;
         spin_unlock_irqrestore(&slock, fl);
-        int fs = to_in_bytes(FRAG_BYTES), b = to_in_bytes(room);
-        int info[4] = { b / fs, to_in_bytes(RING_BYTES - GUARD) / fs, fs, b };
+        int fs = out_to_client(c, FRAG_BYTES), b = out_to_client(c, room);
+        int info[4] = { b / fs, out_to_client(c, RING_BYTES - GUARD) / fs, fs, b };
+        return copy_to_user(arg, info, sizeof info) ? -EFAULT : 0;
+    }
+    case 0x8010500D: {                                  /* SNDCTL_DSP_GETISPACE */
+        if (!c->rec) return -EINVAL;
+        uint64_t fl = spin_lock_irqsave(&slock);
+        update(&in);
+        uint32_t avail = c_avail(c);
+        spin_unlock_irqrestore(&slock, fl);
+        int fs = in_to_client(c, FRAG_BYTES), b = in_to_client(c, avail) + (c->npend - c->pend_off);
+        int info[4] = { b / fs, in_to_client(c, RING_BYTES - GUARD) / fs, fs, b };
         return copy_to_user(arg, info, sizeof info) ? -EFAULT : 0;
     }
     case 0x500E:                                        /* SNDCTL_DSP_NONBLOCK */
         __atomic_or_fetch(&f->flags, O_NONBLOCK, __ATOMIC_RELAXED);
         return 0;
-    case 0x8004500F:                                    /* SNDCTL_DSP_GETCAPS: trigger, realtime */
-        return put_int(arg, 0x00001000 | 0x00000200);
+    case 0x8004500F:                                    /* SNDCTL_DSP_GETCAPS: trigger, realtime, duplex */
+        return put_int(arg, 0x00001000 | 0x00000200 | (hda.cap_ok ? 0x00000100 : 0));
     case 0x80045010:                                    /* SNDCTL_DSP_GETTRIGGER */
-        return put_int(arg, 2);                         /* PCM_ENABLE_OUTPUT */
-    case 0x40045010:                                    /* SNDCTL_DSP_SETTRIGGER */
+        return put_int(arg, c->trigger);
+    case 0x40045010:                                    /* SNDCTL_DSP_SETTRIGGER: remembered */
+        if ((r = get_int(arg, &v))) return r;
+        c->trigger = v & ((c->rec ? 1 : 0) | (c->play ? 2 : 0));
         return 0;
-    case 0x800C5012: {                                  /* SNDCTL_DSP_GETOPTR */
+    case 0x800C5011: {                                  /* SNDCTL_DSP_GETIPTR */
+        if (!c->rec) return -EINVAL;
         uint64_t fl = spin_lock_irqsave(&slock);
-        update();
-        int ci[3] = { to_in_bytes(hda.played), (int)(hda.played / FRAG_BYTES), to_in_bytes(hda.last_pos) };
+        update(&in);
+        int ci[3] = { (int)c->rtotal, (int)(c->rtotal / (uint64_t)in_to_client(c, FRAG_BYTES)), in_to_client(c, in.last_pos) };
+        spin_unlock_irqrestore(&slock, fl);
+        return copy_to_user(arg, ci, sizeof ci) ? -EFAULT : 0;
+    }
+    case 0x800C5012: {                                  /* SNDCTL_DSP_GETOPTR */
+        if (!c->play) return -EINVAL;
+        uint64_t fl = spin_lock_irqsave(&slock);
+        update(&out);
+        uint64_t played = c->wtotal - c_queued(c);
+        int ci[3] = { out_to_client(c, played), (int)(played / FRAG_BYTES), out_to_client(c, out.last_pos) };
         spin_unlock_irqrestore(&slock, fl);
         return copy_to_user(arg, ci, sizeof ci) ? -EFAULT : 0;
     }
     case 0x80045017: {                                  /* SNDCTL_DSP_GETODELAY */
+        if (!c->play) return -EINVAL;
         uint64_t fl = spin_lock_irqsave(&slock);
-        update();
-        int d = hda.running ? to_in_bytes(queued()) : 0;
+        update(&out);
+        int d = out.running ? out_to_client(c, c_queued(c)) : 0;
         spin_unlock_irqrestore(&slock, fl);
         return put_int(arg, d);
     }
@@ -965,7 +1313,7 @@ static int dsp_ioctl_locked(struct file *f, unsigned long req, void *arg)
 }
 
 static const struct vnode_ops dsp_ops = {
-    .open = dsp_open, .fwrite = dsp_fwrite, .poll = dsp_poll, .release = dsp_release,
+    .open = dsp_open, .fwrite = dsp_fwrite, .fread = dsp_fread, .poll = dsp_poll, .release = dsp_release,
     .fioctl = dsp_ioctl, .poll_deadline = dsp_poll_deadline, .nolock = true,
 };
 
@@ -989,9 +1337,12 @@ static int mixer_ioctl(struct file *f, unsigned long req, void *arg)
     case 0x80044DFE:                                    /* SOUND_MIXER_READ_DEVMASK */
     case 0x80044DFB:                                    /* SOUND_MIXER_READ_STEREODEVS */
         return put_int(arg, (1 << MIX_VOLUME) | (1 << MIX_PCM));
-    case 0x80044DFD: case 0x80044DFF:                   /* READ_RECMASK, READ_RECSRC */
-    case 0x80044DFC:                                    /* SOUND_MIXER_READ_CAPS */
-        return put_int(arg, 0);
+    case 0x80044DFD: case 0x80044DFF:                   /* READ_RECMASK, READ_RECSRC: the one input */
+        return put_int(arg, hda.cap_ok ? hda.rec_mask : 0);
+    case 0xC0044DFF:                                    /* SOUND_MIXER_WRITE_RECSRC: nothing to choose */
+        return put_int(arg, hda.cap_ok ? hda.rec_mask : 0);
+    case 0x80044DFC:                                    /* SOUND_MIXER_READ_CAPS: one source at a time */
+        return put_int(arg, 1);
     case 0x805C4D65: {                                  /* SOUND_MIXER_INFO */
         struct { char id[16], name[32]; int modify; int fill[10]; } mi;
         memset(&mi, 0, sizeof mi);
@@ -1041,8 +1392,12 @@ static size_t gen_proc(char *buf, size_t cap, void *ctx)
     else P("codec %d: %s %04x:%04x, audio function group 0x%x\n", hda.caddr, codec_vendor(hda.vendor),
            hda.vendor >> 16, hda.vendor & 0xffff, hda.afg);
     P("outputs: %s\n", hda.outs);
-    P("stream: %d Hz 16-bit stereo, %s, played %lu bytes, queued %u\n", hda.rate,
-      hda.running ? "running" : "stopped", hda.played, hda.running ? queued() : 0);
+    P("inputs: %s\n", hda.cap_ok ? hda.ins : "none");
+    P("playback: %d Hz 16-bit stereo, %s, played %lu bytes, queued %u, %d client(s)\n", out.rate,
+      out.running ? "running" : "stopped", out.pos, out.running ? out_queued() : 0, nplay);
+    if (hda.cap_ok)
+        P("capture: %d Hz 16-bit %s, %s, captured %lu bytes, %d client(s)\n", in.rate, in.ch == 2 ? "stereo" : "mono",
+          in.running ? "running" : "stopped", in.pos, nrec);
     P("volume: %d%%\n", hda.volume);
 #undef P
     return n;
@@ -1091,6 +1446,19 @@ static bool try_controller(struct pci_device *d)
     return hda.ready;
 }
 
+static bool ring_alloc(struct stream *s)
+{
+    s->ring = dma_alloc(RING_BYTES);
+    s->bdl = dma_alloc(BDL_N * sizeof(struct bdl_entry));
+    if (!s->ring || !s->bdl) return false;
+    for (int i = 0; i < BDL_N; i++) {
+        s->bdl[i].addr = (uint64_t)(uintptr_t)(s->ring + i * (RING_BYTES / BDL_N));
+        s->bdl[i].len = RING_BYTES / BDL_N;
+        s->bdl[i].ioc = 0;
+    }
+    return true;
+}
+
 void hda_init(void)
 {
     bool found = false;
@@ -1101,19 +1469,23 @@ void hda_init(void)
         if (!try_controller(c)) hda.ready = false;
     }
     if (!hda.ready) { hda.present = found; return; }
-    hda.ring = dma_alloc(RING_BYTES);
-    hda.bdl = dma_alloc(BDL_N * sizeof(struct bdl_entry));
-    if (!hda.ring || !hda.bdl) { hda.ready = false; return; }
-    for (int i = 0; i < BDL_N; i++) {
-        hda.bdl[i].addr = (uint64_t)(uintptr_t)(hda.ring + i * (RING_BYTES / BDL_N));
-        hda.bdl[i].len = RING_BYTES / BDL_N;
-        hda.bdl[i].ioc = 0;
-    }
-    hda.sd = hda.iss;                                   /* the first output stream */
-    hda.tag = 1;
-    hda.rate = pick_rate(48000, &hda.fmt);
+    if (!ring_alloc(&out)) { hda.ready = false; return; }
+    out.sd = hda.iss;                                   /* the first output stream */
+    out.tag = 1;
+    out.ch = 2;
+    for (int d = 0; d < hda.ndacs; d++) out.conv[d] = hda.dacs[d];
+    out.nconv = hda.ndacs;
+    out.rate = pick_rate(out.rates, 48000, 2, &out.fmt);
     set_volume(100);
-    kprintf("hda: outputs: %s; rates mask 0x%x\n", hda.outs, hda.rates);
+    kprintf("hda: outputs: %s; rates mask 0x%x\n", hda.outs, out.rates);
+    if (hda.iss && setup_inputs() && ring_alloc(&in)) {
+        in.sd = 0;                                      /* the first input stream */
+        in.tag = 2;
+        in.input = true;
+        in.rate = pick_rate(in.rates, 48000, in.ch, &in.fmt);
+        hda.cap_ok = true;
+        kprintf("hda: inputs: %s; rates mask 0x%x\n", hda.ins, in.rates);
+    }
     devfs_register("dsp", 0666, (14u << 8) | 3u, &dsp_ops, NULL);
     devfs_register("mixer", 0666, (14u << 8) | 0u, &mixer_ops, NULL);
     task_create("hdad", hdad_main, NULL);

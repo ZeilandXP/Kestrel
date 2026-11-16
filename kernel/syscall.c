@@ -977,7 +977,7 @@ static int64_t sys_nanosleep(uint64_t req, uint64_t rem, uint64_t a3, uint64_t a
     uint64_t ms = (uint64_t)ts.tv_sec > (1ull << 40) ? (1ull << 50) : (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     uint64_t deadline = time_ms() + ms;
     for (uint64_t now; (now = time_ms()) < deadline; ) {
-        if (signal_pending()) {                         /* EINTR with the time left */
+        if (signal_pending() && !signal_stop_now()) {   /* EINTR with the time left */
             if (rem) {
                 struct timespec r = { (int64_t)((deadline - now) / 1000), (int64_t)((deadline - now) % 1000) * 1000000 };
                 if (copy_to_user((void *)rem, &r, sizeof r)) return -EFAULT;
@@ -1052,7 +1052,7 @@ static int64_t sys_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req, u
                 : (uint64_t)ts.tv_sec * 1000 + ((uint64_t)ts.tv_nsec + 999999) / 1000000;
     uint64_t deadline = time_ms() + ms;
     for (uint64_t now; (now = time_ms()) < deadline; ) {
-        if (signal_pending()) {
+        if (signal_pending() && !signal_stop_now()) {   /* a stop alone: sleep on after it */
             if (rem) {
                 struct timespec r = { (int64_t)((deadline - now) / 1000), (int64_t)((deadline - now) % 1000) * 1000000 };
                 if (copy_to_user((void *)rem, &r, sizeof r)) return -EFAULT;
@@ -1134,8 +1134,10 @@ static int64_t sys_brk(uint64_t addr, uint64_t a2, uint64_t a3, uint64_t a4, uin
 /* mmap(2): anonymous (private or shared), private file mappings (filled from
  * the file on first touch, beyond EOF: SIGBUS), shared mappings of files
  * that keep their data in a vm_object (ramfs, memfd: coherent with
- * read/write), /dev/zero. A shared read-only mapping of another regular file
- * (the boot volume) is the same as a private one. */
+ * read/write), shared mappings of disk files (the page cache's frames,
+ * written back by the file system: vm_mmap_file), /dev/zero. A shared
+ * read-only mapping of another regular file (the boot volume) is the same
+ * as a private one. */
 #define MAP_KNOWN (MAP_TYPE | MAP_FIXED | MAP_ANONYMOUS | MAP_GROWSDOWN | MAP_DENYWRITE | MAP_EXECUTABLE | \
                    MAP_LOCKED | MAP_NORESERVE | MAP_POPULATE | MAP_NONBLOCK | MAP_STACK | MAP_FIXED_NOREPLACE)
 
@@ -1176,7 +1178,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
     }
     if (vn->type != VREG) { r = -ENODEV; goto out; }
     struct vm_object *o = shared ? vfs_vmobject(vn) : NULL;
-    if (shared && o) {
+    if (shared && !o && vn->ops && vn->ops->getpage && vn->ops->page_dirty) {
+        if ((prot & PROT_WRITE) && acc != O_RDWR) { r = -EACCES; goto out; }
+        r = vm_mmap_file(mm, addr, len, (int)prot, (int)flags, f, off);
+    } else if (shared && o) {
         if ((prot & PROT_WRITE) && acc != O_RDWR) { r = -EACCES; goto out; }
         if ((prot & PROT_WRITE) && (o->seals & 0x0008)) { r = -EPERM; goto out; }   /* F_SEAL_WRITE */
         r = vm_mmap(mm, addr, len, (int)prot, (int)flags, NULL, o, off, 0);
@@ -1224,11 +1229,15 @@ static int64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice, uint64_
     return 0;                                           /* hints: accepted */
 }
 
+/* msync(2): MS_SYNC writes back what shared mappings of disk files have
+ * written (every disk volume: simple and safe); MS_ASYNC leaves it to the
+ * file systems' periodic write-back, which looks at mappings too. */
 static int64_t sys_msync(uint64_t addr, uint64_t len, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)len; (void)a4; (void)a5; (void)a6;
     if ((addr & (UVM_PAGE - 1)) || (flags & ~7ull) || ((flags & 1) && (flags & 4))) return -EINVAL;
-    return 0;                                           /* shared mappings are the file's own pages */
+    if (flags & 4) vfs_sync_all(false);                 /* MS_SYNC */
+    return 0;
 }
 
 static int64_t sys_mincore(uint64_t addr, uint64_t len, uint64_t vec, uint64_t a4, uint64_t a5, uint64_t a6)
@@ -2230,7 +2239,7 @@ static int64_t sys_socket(uint64_t dom, uint64_t type, uint64_t proto, uint64_t 
 {
     (void)a4; (void)a5; (void)a6;
     struct file *f;
-    int rc = dom == AF_INET ? inet_create((int)type, (int)proto, &f)
+    int rc = dom == AF_INET || dom == AF_INET6 ? inet_create((int)dom, (int)type, (int)proto, &f)
            : dom == AF_NETLINK || dom == AF_PACKET ? xsock_create((int)dom, (int)type, (int)proto, &f)
            : usock_create((int)dom, (int)type, (int)proto, &f);
     return rc ? rc : install(f, type & SOCK_CLOEXEC);
@@ -2297,10 +2306,10 @@ static int64_t sys_accept4(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t f
     uint32_t got = sizeof a;
     if (xsock_is(f)) { fput(f); return -EOPNOTSUPP; }
     if (inet_is(f)) {
-        struct sockaddr_in sin;
+        union inet_sa sin;
         rc = inet_accept(f, (int)flags, &nf, &sin);
         memcpy(&a, &sin, sizeof sin);
-        got = sizeof sin;
+        got = inet_sa_len(&sin);
     } else rc = usock_accept(f, (int)flags, &nf, &a, &got);
     fput(f);
     if (rc) return rc;
@@ -2328,7 +2337,7 @@ static int64_t sock_xfer(struct file *f, uint64_t ubuf, uint64_t len, int flags,
  * a blocking stream send queues everything, chunk by chunk; a receive
  * returns what one call gets. */
 static int64_t inet_xfer(struct file *f, uint64_t ubuf, uint64_t len, int flags, bool send,
-                         const struct sockaddr_un *to, uint32_t tolen, struct sockaddr_in *from, int *mflags)
+                         const struct sockaddr_un *to, uint32_t tolen, union inet_sa *from, int *mflags)
 {
     bool stream = inet_type(f) == SOCK_STREAM;
     if (len && !ubuf_ok(ubuf, len)) return -EFAULT;
@@ -2413,10 +2422,11 @@ static int64_t sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fl
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
     if (inet_is(f)) {
-        struct sockaddr_in from;
+        union inet_sa from;
+        from.v4.sin_family = AF_INET;
         rc = inet_xfer(f, buf, len, (int)flags, false, NULL, 0, &from, NULL);
         fput(f);
-        if (rc >= 0 && addr && alenp && (int64_t)put_sockaddr(addr, alenp, (const struct sockaddr_un *)&from, sizeof from)) return -EFAULT;
+        if (rc >= 0 && addr && alenp && (int64_t)put_sockaddr(addr, alenp, (const struct sockaddr_un *)&from, inet_sa_len(&from))) return -EFAULT;
         return rc;
     }
     if (xsock_is(f)) {
@@ -2541,7 +2551,7 @@ static int64_t inet_msg_io(struct file *f, struct msghdr_k *m, uint64_t umsg, ui
             if ((size_t)n < want || !stream) break;
         } while ((uint64_t)total < len);
     } else {
-        struct sockaddr_in from;
+        union inet_sa from;
         int mflags = 0;
         long n = inet_recvfrom(f, kb, chunk < len ? chunk : (size_t)len, (int)flags, &from, &mflags);
         if (n < 0) { total = n; goto out; }
@@ -2549,9 +2559,10 @@ static int64_t inet_msg_io(struct file *f, struct msghdr_k *m, uint64_t umsg, ui
         if (sock_io_copy(&cur, kb, got, true)) { total = -EFAULT; goto out; }
         total = n;
         if (m->name) {
-            uint32_t nl = m->namelen < sizeof from ? m->namelen : (uint32_t)sizeof from;
+            uint32_t fl = inet_sa_len(&from);
+            uint32_t nl = m->namelen < fl ? m->namelen : fl;
             if (nl && copy_to_user((void *)m->name, &from, nl)) { total = -EFAULT; goto out; }
-            m->namelen = sizeof from;
+            m->namelen = fl;
         }
         m->controllen = 0;
         m->flags = mflags;
@@ -2699,10 +2710,10 @@ static int64_t sock_name(uint64_t fd, uint64_t addr, uint64_t lenp, bool peer)
     struct sockaddr_un tmp;
     uint32_t got = sizeof tmp;
     if (inet_is(f)) {
-        struct sockaddr_in sin;
+        union inet_sa sin;
         rc = inet_name(f, peer, &sin);
         memcpy(&tmp, &sin, sizeof sin);
-        got = sizeof sin;
+        got = inet_sa_len(&sin);
     } else if (xsock_is(f)) rc = xsock_name(f, peer, &tmp, &got);
     else rc = usock_name(f, peer, &tmp, &got);
     fput(f);
@@ -2796,7 +2807,9 @@ static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offp, uint
         ssize_t w = vfs_write(out, buf, (size_t)n);
         if (w < 0) { if (!total) total = w; break; }
         total += w;
-        if (w < n) break;
+        /* a short read is the end for now: a terminal's EOF or a pipe's
+         * last bytes must not be read past (a file's short read is its end) */
+        if (w < n || (size_t)n < want) break;
     }
 restore:
     if (offp) {
@@ -4049,7 +4062,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     /* sockets: the network stack's lock (net/core.c, net_lock) or the unix
      * sockets' (fs/unixsock.c). Their data calls, polls and ioctls go by
      * fd_nolock above. */
-    case SYS_socket:         return f->rdi == AF_INET || f->rdi == AF_UNIX;
+    case SYS_socket:         return f->rdi == AF_INET || f->rdi == AF_INET6 || f->rdi == AF_UNIX;
     case SYS_socketpair:     return true;
     case SYS_bind: case SYS_listen: case SYS_connect: case SYS_accept: case SYS_accept4:
     case SYS_shutdown: case SYS_getsockname: case SYS_getpeername: case SYS_setsockopt: case SYS_getsockopt:

@@ -562,7 +562,11 @@ static bool r8169_init(struct pci_device *d)
     netif_register(n);
     if (!v || v > 6) t->msi = msi_enable(d, r8169_irq, t, "r8169");   /* Linux keeps the PCI 8169s on INTx: their MSI is unreliable */
     w16(t, INTRSTATUS, 0xffff);
-    if (t->msi >= 0) w16(t, INTRMASK, I_EVENTS);
+    if (t->msi >= 0) {
+        msi_set_lockless(t->msi);                               /* r8169_irq: registers and an atomic */
+        n->irq = true;
+        w16(t, INTRMASK, I_EVENTS);
+    }
     kprintf("r8169: %s: Realtek %s (XID %03x, version %d) at %02x:%02x.%u, %s, %d descriptors, %s\n", n->name, chip_name(v),
             xid, v, d->bus, d->device, d->function, t->fast_only ? "10/100" : "10/100/1000", NDESC,
             t->msi >= 0 ? "MSI" : "polled");

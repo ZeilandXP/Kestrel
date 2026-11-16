@@ -421,13 +421,14 @@ void net_kick(void)
     if (netd) wakeup(&netd_chan);
 }
 
-/* The boot CPU's 1 kHz tick: a received frame or a due timer wakes netd. */
+/* The boot CPU's 1 kHz tick: a due timer, or a frame on a card without
+ * interrupts (polled: one descriptor read per card), wakes netd. */
 void net_tick(void)
 {
     if (!netd) return;
     bool due = netd_wake || (next_timer && time_ms() >= next_timer);
     for (struct netif *n = ifaces; n && !due; n = n->next)
-        if (n->pending && n->pending(n)) due = true;
+        if (!n->irq && n->pending && n->pending(n)) due = true;    /* cards with interrupts wake netd themselves */
     if (due) wakeup(&netd_chan);
 }
 
@@ -509,6 +510,18 @@ static bool static_config(struct netif *nif)
 bad:
     kprintf("net: kestrel.ip=%s not understood (ADDR/PREFIX[,GATEWAY[,DNS]])\n", v);
     return false;
+}
+
+void net_hotplug(struct netif *n)
+{
+    char mode[16] = "dhcp";
+    cmdline_get("kestrel.net", mode, sizeof mode);
+    if (!strcmp(mode, "off")) { kprintf("net: %s left down (kestrel.net=off)\n", n->name); return; }
+    uint64_t f = net_lock();
+    n->flags |= IFF_UP | IFF_BROADCAST | IFF_MULTICAST;
+    net_unlock(f);
+    netif_carrier(n, !n->link_up || n->link_up(n));
+    dhcp_start(n);
 }
 
 void net_init(void)

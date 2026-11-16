@@ -10,18 +10,22 @@
  * One receive and one transmit ring of 128 sixteen-byte descriptors, a
  * 2 KiB buffer per descriptor. The MAC address comes from the receive
  * address registers the card loads from its EEPROM at reset (read through
- * EERD if they are empty). Interrupts stay masked: the network thread
- * polls the descriptor done bits when the system tick sees one set
- * (net.h). The link is brought up with auto speed detection (CTRL.SLU and
+ * EERD if they are empty). Cards with MSI (the PCIe 8257x, QEMU's e1000e)
+ * interrupt on received frames, ring overruns and link changes: the
+ * handler masks the card and wakes the network thread, whose poll unmasks
+ * it once the ring is empty. The others (the PCI 8254x, QEMU's e1000) keep
+ * their interrupts masked, and the network thread polls the descriptor
+ * done bits when the system tick sees one set (net.h). The link is brought up with auto speed detection (CTRL.SLU and
  * ASDE); the PHY negotiates on its own. */
 #include <kernel/net.h>
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
 #include <kernel/time.h>
+#include <kernel/msi.h>
 #include "nic.h"
 
 enum {
-    CTRL = 0x0000, STATUS = 0x0008, EERD = 0x0014, ICR = 0x00C0, IMC = 0x00D8,
+    CTRL = 0x0000, STATUS = 0x0008, EERD = 0x0014, ICR = 0x00C0, ITR = 0x00C4, IMS = 0x00D0, IMC = 0x00D8,
     RCTL = 0x0100, TCTL = 0x0400, TIPG = 0x0410,
     RDBAL = 0x2800, RDBAH = 0x2804, RDLEN = 0x2808, RDH = 0x2810, RDT = 0x2818, RDTR = 0x2820,
     TDBAL = 0x3800, TDBAH = 0x3804, TDLEN = 0x3808, TDH = 0x3810, TDT = 0x3818,
@@ -45,6 +49,11 @@ enum {
 #define TCTL_COLD(x) ((uint32_t)(x) << 12)
 #define TCTL_RTLC   (1u << 24)
 #define RAH_AV      (1u << 31)
+#define ICR_LSC     (1u << 2)           /* link status change */
+#define ICR_RXDMT0  (1u << 4)           /* receive ring running low */
+#define ICR_RXO     (1u << 6)           /* receive overrun */
+#define ICR_RXT0    (1u << 7)           /* frame received */
+#define IRQ_EVENTS  (ICR_LSC | ICR_RXDMT0 | ICR_RXO | ICR_RXT0)
 
 #define RXD_DD   0x01
 #define RXD_EOP  0x02
@@ -68,6 +77,9 @@ struct e1k {
     uint32_t rx_next;                   /* next receive descriptor to look at */
     uint32_t tx_tail, tx_clean;         /* next free, oldest in flight */
     bool eerd_new;                      /* 82541/82547/8257x: EERD done = bit 1, address << 2 */
+    int msi;                            /* the vector, or -1: polled from the tick */
+    uint32_t events;                    /* ICR bits the interrupt saw, for poll */
+    bool link;                          /* what the last poll saw */
 };
 
 static uint32_t rd(struct e1k *e, uint32_t r) { return *(volatile uint32_t *)(e->regs + r); }
@@ -149,6 +161,16 @@ static int e1k_xmit(struct netif *nif, const void *frame, size_t len)
 static void e1k_poll(struct netif *nif)
 {
     struct e1k *e = nif->priv;
+    uint32_t ev = __atomic_exchange_n(&e->events, 0, __ATOMIC_ACQ_REL);
+    if (ev & ICR_RXO) nif->rx_dropped++;               /* the card does not say how many */
+    if (e->msi >= 0) {                                  /* polled cards have no link interrupt */
+        bool up = (rd(e, STATUS) & STATUS_LU) != 0;
+        if ((ev & ICR_LSC) || up != e->link) {
+            if (up != e->link) kprintf("e1000: %s: link %s\n", nif->name, up ? "up" : "down");
+            e->link = up;
+            netif_carrier(nif, up);
+        }
+    }
     int n = 0;
     while ((e->rx[e->rx_next].status & RXD_DD) && n < 64) {
         nic_fence();
@@ -164,6 +186,20 @@ static void e1k_poll(struct netif *nif)
         n++;
     }
     tx_reclaim(e);
+    /* Caught up: interrupts back on. A frame that came meanwhile has its
+     * cause bit set already and interrupts at once. */
+    if (e->msi >= 0 && !(e->rx[e->rx_next].status & RXD_DD)) wr(e, IMS, IRQ_EVENTS);
+}
+
+/* MSI: mask the card, note why, and hand the work to the network thread. */
+static void e1k_irq(void *arg)
+{
+    struct e1k *e = arg;
+    uint32_t icr = rd(e, ICR);                          /* reading clears it */
+    if (!icr || icr == 0xffffffff) return;
+    wr(e, IMC, 0xffffffff);
+    __atomic_or_fetch(&e->events, icr, __ATOMIC_ACQ_REL);
+    net_kick();
 }
 
 static bool e1k_pending(struct netif *nif)
@@ -182,6 +218,7 @@ static bool e1k_init(struct pci_device *d, bool eerd_new, const char *model)
 {
     struct e1k *e = kzalloc(sizeof *e);
     if (!e) return false;
+    e->msi = -1;
     e->eerd_new = eerd_new;
     pci_enable(d, false, true, true);
     e->regs = nic_mmio(d, 0, NULL);
@@ -235,8 +272,20 @@ static bool e1k_init(struct pci_device *d, bool eerd_new, const char *model)
     n->pending = e1k_pending;
     n->link_up = e1k_link;
     n->priv = e;
-    kprintf("e1000: Intel %s at %02x:%02x.%u\n", model, d->bus, d->device, d->function);
+    e->link = e1k_link(n);
     netif_register(n);
+    /* The 82574's MSI-X needs its causes mapped to vectors (IVAR): plain MSI
+     * keeps the classic causes. The PCI 8254x have no MSI and stay polled. */
+    e->msi = msi_enable_msi(d, e1k_irq, e, "e1000");
+    if (e->msi >= 0) {
+        msi_set_lockless(e->msi);
+        n->irq = true;
+        wr(e, ITR, 0);                                  /* no throttling: netd batches anyway */
+        (void)rd(e, ICR);
+        wr(e, IMS, IRQ_EVENTS);
+    }
+    kprintf("e1000: %s: Intel %s at %02x:%02x.%u, %s\n", n->name, model, d->bus, d->device, d->function,
+            e->msi >= 0 ? "MSI" : "polled");
     return true;
 }
 

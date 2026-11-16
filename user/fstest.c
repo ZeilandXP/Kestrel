@@ -9,6 +9,9 @@
  *   fstest -c               check them after a reboot, then remove them
  *   fstest -r               both, across a reboot: write them and restart, or
  *                           (when they are there) check them and power off
+ *   fstest -a               write /var/fstest-async through a mapping and
+ *                           wait, never syncing: the periodic write-back
+ *                           must get it to the disk (check on the host)
  *   -p (with any of these)  power off when done (sync first)
  * Exit status 0 = every check passed. */
 #define _GNU_SOURCE
@@ -29,6 +32,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/reboot.h>
 
 static int failures;
@@ -128,6 +132,7 @@ static const char *in(const char *dir, const char *name) { snprintf(P, sizeof P,
 static void inotify_checks(const char *dir);
 static void lock_checks(const char *dir);
 static void fifo_checks(const char *dir);
+static void mmap_checks(const char *dir);
 
 static void checks(const char *dir)
 {
@@ -290,6 +295,9 @@ static void checks(const char *dir)
 
     printf("named pipes (FIFOs):\n");
     fifo_checks(dir);
+
+    printf("shared writable mappings:\n");
+    mmap_checks(dir);
 
     printf("space accounting:\n");
     rm_rf(dir);
@@ -515,6 +523,90 @@ static void lock_checks(const char *dir)
     close(m);
 }
 
+/* MAP_SHARED, PROT_WRITE of a disk file: the page cache's pages, written
+ * back by the file system (that they reach the disk: -r and -a). */
+static int pattern_at(const uint8_t *m, uint64_t off, size_t len, unsigned seed)
+{
+    for (size_t i = 0; i < len; i++) if (m[i] != pat(off + i, seed)) return 0;
+    return 1;
+}
+
+static int map_write(const char *path, size_t len, unsigned seed, uint8_t **keep)
+{
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || ftruncate(fd, (off_t)len) < 0) return -1;
+    uint8_t *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);                                          /* the mapping keeps the file */
+    if (m == MAP_FAILED) return -1;
+    for (size_t i = 0; i < len; i++) m[i] = pat(i, seed);
+    if (keep) *keep = m;
+    else munmap(m, len);
+    return 0;
+}
+
+static void mmap_checks(const char *dir)
+{
+    char path[512];
+    snprintf(path, sizeof path, "%s/mapped", dir);
+    size_t len = 3 * 4096 + 500;
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0 && ftruncate(fd, (off_t)len) == 0, "a file to map: 3 pages and 500 bytes, all a hole");
+    uint8_t *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    CHECK(m != MAP_FAILED, "mmap(MAP_SHARED, PROT_READ | PROT_WRITE)");
+    if (m == MAP_FAILED) { close(fd); return; }
+    CHECK(m[5000] == 0 && m[len - 1] == 0, "the hole reads as zeros through it");
+    for (size_t i = 0; i < len; i++) m[i] = pat(i, 21);
+    uint8_t b[600];
+    CHECK(pread(fd, b, sizeof b, 4000) == (ssize_t)sizeof b && pattern_at(b, 4000, sizeof b, 21),
+          "read() sees writes through the mapping at once");
+    CHECK(pwrite(fd, "HELLO", 5, 8190) == 5 && !memcmp(m + 8190, "HELLO", 5), "the mapping sees write() at once");
+    for (size_t i = 8190; i < 8195; i++) m[i] = pat(i, 21);
+    struct stat st;
+    CHECK(msync(m, len, MS_SYNC) == 0 && fstat(fd, &st) == 0 && st.st_blocks * 512 >= (blkcnt_t)len,
+          "msync(MS_SYNC) writes it back: the hole has blocks now");
+    pid_t k = fork();
+    if (k == 0) { m[100] = 0xAB; _exit(0); }
+    int ws;
+    waitpid(k, &ws, 0);
+    CHECK(m[100] == 0xAB, "a child's write through the inherited mapping shows in the parent");
+    m[100] = pat(100, 21);
+    uint8_t *m2 = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 4096);
+    int same = m2 != MAP_FAILED && m2[10] == m[4106];
+    if (m2 != MAP_FAILED) { m2[10] ^= 0xFF; same = same && m[4106] == m2[10]; m2[10] ^= 0xFF; munmap(m2, 4096); }
+    CHECK(same, "two mappings of the same page share it");
+    uint8_t *pm = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    if (pm != MAP_FAILED) { pm[0] ^= 0xFF; }
+    CHECK(pm != MAP_FAILED && m[0] == pat(0, 21) && pm[0] != m[0], "a private mapping's write stays private");
+    if (pm != MAP_FAILED) munmap(pm, 4096);
+    CHECK(mprotect(m, len, PROT_READ) == 0 && mprotect(m, len, PROT_READ | PROT_WRITE) == 0 && (m[1] = pat(1, 21), 1),
+          "mprotect read-only and back");
+    uint8_t *big = mmap(NULL, 5 * 4096, PROT_READ, MAP_SHARED, fd, 0);
+    k = fork();
+    if (k == 0) { volatile uint8_t x = big[4 * 4096]; (void)x; _exit(0); }
+    waitpid(k, &ws, 0);
+    CHECK(big != MAP_FAILED && WIFSIGNALED(ws) && WTERMSIG(ws) == SIGBUS, "a page wholly past the end: SIGBUS");
+    if (big != MAP_FAILED) munmap(big, 5 * 4096);
+    munmap(m, len);
+    close(fd);
+    CHECK(check_pattern(path, 0, len, 21), "after munmap and close the file holds what was written");
+    int ro = open(path, O_RDONLY);
+    CHECK(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, ro, 0) == MAP_FAILED && errno == EACCES,
+          "PROT_WRITE on a read-only descriptor: EACCES");
+    void *r = mmap(NULL, 4096, PROT_READ, MAP_SHARED, ro, 0);
+    CHECK(r != MAP_FAILED && mprotect(r, 4096, PROT_READ | PROT_WRITE) < 0 && errno == EACCES, "...nor can mprotect add it");
+    if (r != MAP_FAILED) munmap(r, 4096);
+    close(ro);
+    char big2[512];
+    snprintf(big2, sizeof big2, "%s/mapped-big", dir);
+    uint8_t *keep = NULL;
+    CHECK(map_write(big2, 3 << 20, 22, &keep) == 0 && check_pattern(big2, 0, 3 << 20, 22), "a 3 MiB file written through a mapping");
+    sync();
+    if (keep) munmap(keep, 3 << 20);
+    CHECK(check_pattern(big2, 0, 3 << 20, 22), "...synced while mapped, then unmapped");
+    unlink(big2);
+    unlink(path);
+}
+
 #define PERSIST "/var/fstest-persist"
 
 int main(int argc, char **argv)
@@ -527,6 +619,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-c")) mode = 'c';
         else if (!strcmp(argv[i], "-p")) poweroff = 1;
         else if (!strcmp(argv[i], "-r")) mode = 'r';
+        else if (!strcmp(argv[i], "-a")) mode = 'a';
         else dir = argv[i];
     }
     printf("fstest: pid %d\n", getpid());
@@ -542,6 +635,15 @@ int main(int argc, char **argv)
         CHECK(write_pattern(PERSIST "/data", 0, 300000, 11, O_TRUNC) == 0, "persistence: 300000-byte file");
         CHECK(symlink("data", PERSIST "/link") == 0, "persistence: symlink");
         CHECK(link(PERSIST "/data", PERSIST "/hard") == 0, "persistence: hard link");
+        CHECK(map_write(PERSIST "/mapped", 70000, 12, NULL) == 0, "persistence: a file written through a mapping, unmapped");
+        static uint8_t *live;
+        CHECK(map_write(PERSIST "/mapped-live", 70000, 13, &live) == 0, "persistence: one still mapped at the restart");
+    } else if (mode == 'a') {                           /* the periodic write-back, no sync: check on the host */
+        uint8_t *live = NULL;
+        CHECK(map_write("/var/fstest-async", 200000, 14, &live) == 0, "a file written through a mapping, kept mapped");
+        sleep(12);
+        printf("fstest: written, not synced (now check /var/fstest-async on the image)\n");
+        pause();
     } else if (mode == 'c') {
         struct stat st;
         char t[16] = { 0 };
@@ -549,6 +651,8 @@ int main(int argc, char **argv)
         CHECK(readlink(PERSIST "/link", t, sizeof t - 1) == 4 && !strcmp(t, "data"), "after reboot: the symlink");
         CHECK(stat(PERSIST "/hard", &st) == 0 && st.st_nlink == 2 && check_pattern(PERSIST "/hard", 0, 300000, 11),
               "after reboot: the hard link");
+        CHECK(check_pattern(PERSIST "/mapped", 0, 70000, 12), "after reboot: the file written through a mapping");
+        CHECK(check_pattern(PERSIST "/mapped-live", 0, 70000, 13), "after reboot: the one still mapped at the restart");
         rm_rf(PERSIST);
         CHECK(access(PERSIST, F_OK) < 0, "removed");
     } else {

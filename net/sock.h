@@ -34,6 +34,11 @@ struct isock {
      * it can be bound to a port on "any address" and listened on, and
      * nothing ever reaches it */
     bool     isolated, listening;
+    /* AF_INET6 (net/socket.c): the addresses are shown v4-mapped; v6only
+     * takes no IPv4 peers (and leaves an IPv4 socket its port); lo6: the
+     * loopback is ::1 on this socket (bound or connected to it, or a peer
+     * that is an AF_INET6 socket itself) */
+    bool     v6, v6only, lo6;
 };
 
 static inline struct isock *isk(struct file *f) { return f->vn->data; }
@@ -56,6 +61,14 @@ long dgram_recv(struct isock *s, struct file *f, void *buf, size_t len, int flag
                 struct sockaddr_in *from, int *msg_flags);
 void dgram_flush(struct isock *s);
 bool dgram_port_used(int proto, uint32_t addr, uint16_t port, struct isock *except, bool reuse);
+bool dgram_sender_v6(int proto, uint32_t addr, uint16_t port); /* is that sender an AF_INET6 socket */
+/* do a and b (b may be NULL: no socket) share one port space: an AF_INET6
+ * socket with IPV6_V6ONLY and an AF_INET socket do not */
+static inline bool same_family_space(const struct isock *a, const struct isock *b)
+{
+    bool b6 = b && b->v6, b6only = b && b->v6only;
+    return !((a->v6only && !b6) || (b6only && !a->v6));
+}
 
 /* streams (net/tcp.c) */
 int  tcp_attach(struct isock *s);               /* new socket: allocate its tcb */
@@ -74,5 +87,8 @@ int  tcp_info_state(struct isock *s);
 bool tcp_port_used(uint32_t addr, uint16_t port, struct isock *except, bool reuse);
 void tcp_setopt_nodelay(struct isock *s);
 struct isock *isock_new(int type, int proto);   /* net/socket.c */
+/* "0100007F:0016" for /proc/net/tcp; for tcp6 the 16 bytes as four words,
+ * v4-mapped (or ::1 when lo6) */
+void proc_addr(char out[40], uint32_t ip, uint16_t port, bool v6, bool lo6);
 
 #endif

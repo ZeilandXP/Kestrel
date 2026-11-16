@@ -47,6 +47,7 @@ bool dgram_port_used(int proto, uint32_t addr, uint16_t port, struct isock *exce
     for (struct isock *s = dgrams; s; s = s->next) {
         if (s == except || s->proto != proto || s->lport != port) continue;
         if (s->laddr && addr && s->laddr != addr) continue;
+        if (except && !same_family_space(except, s)) continue;
         if (reuse && (s->reuseaddr || s->reuseport)) continue;
         return true;
     }
@@ -101,8 +102,8 @@ void udp_input(struct netif *nif, struct pkt *p, uint32_t src, uint32_t dst)
         for (struct isock *s = dgrams; s; s = s->next) {
             if (s->proto != IPPROTO_UDP || s->lport != dport) continue;
             if (s->laddr && s->laddr != dst) continue;
-            int sc = s->laddr ? 1 : 0;
-            if (s->connected) { if (s->raddr != src || s->rport != sport) continue; sc += 2; }
+            int sc = (s->laddr ? 2 : 0) + (s->v6only ? 0 : 1);   /* V6ONLY: see net/socket.c */
+            if (s->connected) { if (s->raddr != src || s->rport != sport) continue; sc += 4; }
             if (sc > score) { score = sc; best = s; }
         }
         if (best) { enqueue(best, p, src, sport); return; }
@@ -274,15 +275,27 @@ long dgram_recv(struct isock *s, struct file *f, void *buf, size_t len, int flag
 }
 
 /* /proc/net/udp, Linux layout (enough for netstat/ss) */
-size_t udp_proc(char *buf, size_t cap)
+bool dgram_sender_v6(int proto, uint32_t addr, uint16_t port)
 {
-    size_t n = (size_t)snprintf(buf, cap, "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
+    for (struct isock *s = dgrams; s; s = s->next)
+        if (s->proto == proto && s->lport == port && (!s->laddr || s->laddr == addr)) return s->v6;
+    return false;
+}
+
+/* /proc/net/udp, or udp6 (the AF_INET6 sockets') */
+size_t udp_proc(char *buf, size_t cap, bool v6)
+{
+    size_t n = (size_t)snprintf(buf, cap, v6 ?
+        "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n" :
+        "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
     int i = 0;
     for (struct isock *s = dgrams; s && n < cap; s = s->next) {
-        if (s->proto != IPPROTO_UDP) continue;
-        n += (size_t)snprintf(buf + n, cap - n, "%5d: %08X:%04X %08X:%04X %02X %08X:%08X 00:00000000 00000000     0        0 0\n",
-                              i++, s->laddr, be16(s->lport), s->raddr, be16(s->rport), s->connected ? 1 : 7,
-                              0u, (unsigned)s->rq_bytes);
+        if (s->proto != IPPROTO_UDP || s->v6 != v6) continue;
+        char la[40], ra[40];
+        proc_addr(la, s->laddr, s->lport, v6, s->lo6);
+        proc_addr(ra, s->raddr, s->rport, v6, s->lo6);
+        n += (size_t)snprintf(buf + n, cap - n, "%5d: %s %s %02X %08X:%08X 00:00000000 00000000     0        0 0\n",
+                              i++, la, ra, s->connected ? 1 : 7, 0u, (unsigned)s->rq_bytes);
     }
     return n < cap ? n : cap;
 }

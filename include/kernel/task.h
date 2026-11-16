@@ -88,7 +88,15 @@ struct signal_struct {              /* CLONE_THREAD: the thread group        */
     bool      exec_kill;            /* execve is ending the other threads:
                                        their deaths are not the group's      */
     struct kstat_task dead;         /* counters of the threads that exited   */
+    /* job control (proc/process.c): a stop signal's default action stops
+     * every thread until SIGCONT (or SIGKILL); the parent may learn of
+     * each change once through wait4/waitid (WUNTRACED, WCONTINUED). */
+    bool      stopped;
+    uint8_t   stop_sig;             /* the signal that stopped it            */
+    uint8_t   notify;               /* JOB_NOTIFY_*: not collected by wait yet */
 };
+#define JOB_NOTIFY_STOPPED    1
+#define JOB_NOTIFY_CONTINUED  2
 
 /* Thread Control Block: one per kernel thread and per user thread. A user
  * process is a thread group: its threads share one tgid (= the leader's tid,

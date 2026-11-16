@@ -70,6 +70,7 @@
 #include "globals.h"
 #ifdef DRI3
 #include "kdri3.h"
+#include "kglx.h"
 #endif
 
 /* ---- kernel interfaces (Kestrel include/kernel/kfb.h, kinput.h) ---------- */
@@ -706,6 +707,7 @@ InitOutput(int argc, char **argv)
     screenInfo.bitmapBitOrder = BITMAP_BIT_ORDER;
     screenInfo.numPixmapFormats = n;
 
+    kGlxInit();
     if (AddScreen(kScreenInit, argc, argv, NULL) == -1)
         FatalError("kestrel: couldn't add the screen\n");
 }

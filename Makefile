@@ -87,7 +87,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/lockcheck.c kerne
            fs/vfs.c fs/devfs.c fs/procfs.c fs/sysfs.c \
            ui/bootmgr.c \
            net/core.c net/arp.c net/ipv4.c net/udp.c net/tcp.c net/socket.c net/dhcp.c net/proc.c net/msock.c net/netlink.c net/packet.c \
-           drivers/net/virtio_net.c drivers/net/e1000.c drivers/net/rtl8139.c drivers/sound/hda.c drivers/net/rtl8169.c \
+           drivers/net/virtio_net.c drivers/net/e1000.c drivers/net/rtl8139.c drivers/sound/hda.c drivers/net/rtl8169.c drivers/net/usbnet.c \
            lib/string.c lib/printf.c
 
 # The real-mode emulator behind kernel/vbe_emu.c (third_party/x86emu, from
@@ -209,7 +209,7 @@ KERNEL_CMDLINE ?=
 ROOTFS_BASE ?=
 ROOTDISK    := $(BUILD)/rootdisk.ext2
 
-.PHONY: FORCE lkpi-drm-check lkpi-nv-check lkpi-nv-cflags xlibre icewm busybox sysvinit xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts images clean distclean
+.PHONY: FORCE lkpi-drm-check lkpi-nv-check lkpi-nv-cflags xlibre icewm busybox sysvinit xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia test-usbnet fonts images clean distclean
 
 all: $(KERNEL)
 
@@ -693,7 +693,14 @@ test-nvidia:
 	    drivers/gpu/nvidia/nvidia.c drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvfmt.c -o $(BUILD)/nvidia_sim_test
 	@$(BUILD)/nvidia_sim_test > $(BUILD)/nvidia_sim_test.log; rc=$$?; tail -1 $(BUILD)/nvidia_sim_test.log; exit $$rc
 
-test: test-pci test-nvbios test-nvidia
+# Host-side test of the USB network framing (CDC NCM blocks, RNDIS, ECM)
+test-usbnet:
+	@mkdir -p $(BUILD)
+	@$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -Wno-maybe-uninitialized -fsanitize=address,undefined -Iinclude -Idrivers/usb \
+	    drivers/net/test/usbnet_test.c -o $(BUILD)/usbnet_test
+	@$(BUILD)/usbnet_test | tail -1
+
+test: test-pci test-nvbios test-nvidia test-usbnet
 
 check: $(KERNEL)
 	@test -n "$(GRUB_FILE)" || { echo "error: grub-file not found"; exit 1; }

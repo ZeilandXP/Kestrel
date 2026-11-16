@@ -91,6 +91,11 @@ struct vnode_ops {
      * page cache now in large requests, or for a large range read the file
      * in larger pieces from then on. Stops at the end of the file. */
     int     (*readahead)(struct vnode *vn, uint64_t idx, uint64_t count);
+    /* Optional, with getpage: page idx was written through a shared
+     * mapping (vm.c); mark it dirty in the page cache for write-back.
+     * Called with an address space locked: no sleeping, no file system
+     * lock. Files that have it can be mapped MAP_SHARED and writable. */
+    void    (*page_dirty)(struct vnode *vn, uint64_t idx);
     /* Optional: the time_ms() at which readiness may change on its own
      * (timerfd expiry), so poll/epoll sleep exactly that long. 0: never. */
     uint64_t (*poll_deadline)(struct file *f);
@@ -342,6 +347,7 @@ void devfs_add_monitor(int index);      /* /dev/ttyN, /dev/fbN of a late monitor
 /* fs/pty.c: /dev/ptmx and /dev/pts/N (created by devfs_init) */
 void          pty_init(struct vnode *devroot);
 int           pty_open_ctty(int flags, struct file **out);    /* /dev/tty of a pty session */
+int           pty_fg_pgrp(int ctty);    /* a task's ctty (pty index + 1): its foreground group, or -1 */
 /* Console ptys (kernel/vt.c): the kernel holds the master; `tty_node`
  * (/dev/ttyN) becomes the slave. Returns the pty index or -errno. */
 int           pty_console_create(struct vnode *tty_node, int rows, int cols);

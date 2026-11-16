@@ -4,8 +4,14 @@
 #include <kernel/spinlock.h>
 #include <kernel/string.h>
 
+/* pages[] holds frame addresses, page aligned: bit 0 marks a page written
+ * through a shared mapping and not written back yet. */
+#define DIRTY 1ull
+#define FRAME(e) ((e) & ~DIRTY)
+
 struct pcache {
     uint64_t *pages;            /* physical addresses, 0 = not cached     */
+    uint64_t  ndirty;           /* pages with DIRTY                        */
     uint64_t  npages;           /* capacity of pages[]                    */
     uint64_t  count;            /* pages cached                           */
     uint64_t  used;             /* LRU stamp: the last lookup             */
@@ -15,7 +21,7 @@ struct pcache {
 
 static struct spinlock lock;
 static struct pcache *all;
-static uint64_t stamp, files, total, hits, misses, ahead, evicted, passes;
+static uint64_t stamp, files, total, hits, misses, ahead, evicted, passes, dirty_total;
 
 struct pcache *pcache_new(void)
 {
@@ -38,8 +44,9 @@ void pcache_free(struct pcache *pc)
     if (pc->next) pc->next->prev = pc->prev;
     files--;
     total -= pc->count;
+    dirty_total -= pc->ndirty;
     spin_unlock_irqrestore(&lock, f);
-    for (uint64_t i = 0; i < pc->npages; i++) if (pc->pages[i]) page_unref(pc->pages[i]);
+    for (uint64_t i = 0; i < pc->npages; i++) if (pc->pages[i]) page_unref(FRAME(pc->pages[i]));
     kfree(pc->pages);
     kfree(pc);
 }
@@ -47,7 +54,7 @@ void pcache_free(struct pcache *pc)
 uint64_t pcache_lookup(struct pcache *pc, uint64_t idx, bool count)
 {
     uint64_t f = spin_lock_irqsave(&lock);
-    uint64_t p = idx < pc->npages ? pc->pages[idx] : 0;
+    uint64_t p = idx < pc->npages ? FRAME(pc->pages[idx]) : 0;
     if (p) page_ref(p);
     pc->used = ++stamp;
     if (count) { if (p) hits++; else misses++; }
@@ -90,7 +97,7 @@ uint64_t pcache_insert(struct pcache *pc, uint64_t idx, uint64_t phys, bool ra)
         kfree(old);
     }
     uint64_t f = spin_lock_irqsave(&lock);
-    uint64_t have = pc->pages[idx];
+    uint64_t have = FRAME(pc->pages[idx]);
     if (have) {
         page_ref(have);
     } else {
@@ -124,8 +131,9 @@ void pcache_truncate(struct pcache *pc, uint64_t size)
     uint64_t keep = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t f = spin_lock_irqsave(&lock);
     for (uint64_t i = keep; i < pc->npages; i++) {
-        uint64_t p = pc->pages[i];
+        uint64_t p = FRAME(pc->pages[i]);
         if (!p) continue;
+        if (pc->pages[i] & DIRTY) { pc->ndirty--; dirty_total--; }    /* past the end: nothing to keep */
         pc->pages[i] = 0;
         pc->count--;
         total--;
@@ -153,7 +161,7 @@ uint64_t pcache_shrink(uint64_t want)
         v->scanned = pass;
         for (uint64_t i = 0; i < v->npages && freed < want; i++) {
             uint64_t p = v->pages[i];
-            if (!p || page_refs(p) != 1) continue;      /* mapped or being read: stays */
+            if (!p || (p & DIRTY) || page_refs(p) != 1) continue;  /* dirty, mapped or being read: stays */
             v->pages[i] = 0;
             v->count--;
             total--;
@@ -166,6 +174,41 @@ uint64_t pcache_shrink(uint64_t want)
     return freed;
 }
 
+void pcache_set_dirty(struct pcache *pc, uint64_t idx)
+{
+    if (!pc) return;
+    uint64_t f = spin_lock_irqsave(&lock);
+    if (idx < pc->npages && pc->pages[idx] && !(pc->pages[idx] & DIRTY)) {
+        pc->pages[idx] |= DIRTY;
+        pc->ndirty++;
+        dirty_total++;
+    }
+    spin_unlock_irqrestore(&lock, f);
+}
+
+uint64_t pcache_take_dirty(struct pcache *pc, uint64_t *idx)
+{
+    if (!pc) return 0;
+    uint64_t f = spin_lock_irqsave(&lock), p = 0;
+    for (uint64_t i = *idx; pc->ndirty && i < pc->npages; i++)
+        if (pc->pages[i] & DIRTY) {
+            pc->pages[i] &= ~DIRTY;
+            pc->ndirty--;
+            dirty_total--;
+            p = pc->pages[i];
+            page_ref(p);
+            *idx = i;
+            break;
+        }
+    spin_unlock_irqrestore(&lock, f);
+    return p;
+}
+
+bool pcache_dirty(struct pcache *pc)
+{
+    return pc && __atomic_load_n(&pc->ndirty, __ATOMIC_RELAXED);
+}
+
 void pcache_stats(struct pcache_stats *s)
 {
     uint64_t f = spin_lock_irqsave(&lock);
@@ -175,5 +218,6 @@ void pcache_stats(struct pcache_stats *s)
     s->misses = misses;
     s->ahead = ahead;
     s->evicted = evicted;
+    s->dirty = dirty_total;
     spin_unlock_irqrestore(&lock, f);
 }

@@ -37,7 +37,9 @@ def decompress(path):
         with open(path, "rb") as f:
             return zstandard.ZstdDecompressor().decompress(f.read(), max_output_size=64 << 20)
     except ImportError:
-        return subprocess.run(["zstd", "-dc", path], check=True, capture_output=True).stdout
+        # through a pipe: the zstd tool skips a path that is a symbolic link
+        with open(path, "rb") as f:
+            return subprocess.run(["zstd", "-dc"], stdin=f, check=True, capture_output=True).stdout
 
 
 def license_text(top):

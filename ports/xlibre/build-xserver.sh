@@ -3,12 +3,15 @@
 #
 # Configure and build XLibre for Kestrel with musl against the sysroot made
 # by build-sysroot.sh. Only what Kestrel can run today is enabled: software
-# rendering (fb), no GL, no udev/logind/libseat, no input thread, no
+# rendering (fb), no GL in the server, no udev/logind/libseat, no input thread, no
 # XDMCP, Unix-socket listening only, built-in fonts, a precompiled keymap.
 # MIT-SHM is on: clients hand the server a memfd over the socket
 # (ShmAttachFd, SCM_RIGHTS), let it make one (ShmCreateSegment) or attach a
 # System V segment (ShmAttach). DRI3 is on: hw/kestrel/kdri3.c shows linear
-# GPU buffers that clients hand over as dma-bufs (Vulkan on a GPU).
+# GPU buffers that clients hand over as dma-bufs (Vulkan on a GPU). GLX is
+# on for direct rendering only: hw/kestrel/kglx.c offers the fbconfigs and
+# the client's Mesa draws (llvmpipe), linked against the sysroot's empty
+# libGL because the server itself never calls GL.
 set -eu
 SRC=$(cd "$1" && pwd)
 SYSROOT=$(cd "$2" && pwd)
@@ -25,7 +28,7 @@ if [ ! -f "$OUT/build/build.ninja" ]; then
     meson setup "$OUT/build" "$SRC" --cross-file "$OUT/kestrel-cross.txt" \
         -Dxorg=false -Dxephyr=false -Dxnest=false -Dxvfb=true -Dxwin=false -Dxquartz=false \
         $KOPT \
-        -Dglamor=false -Dglx=false -Dxdmcp=false -Dxdm-auth-1=false \
+        -Dglamor=false -Dglx=true -Dglx_dri=false -Dxdmcp=false -Dxdm-auth-1=false \
         -Dudev=false -Dudev_kms=false -Dsystemd_logind=false -Dseatd_libseat=false \
         -Dinput_thread=false -Dmitshm=true -Ddri1=false -Ddri2=false -Ddri3=true -Ddrm=false \
         -Dpciaccess=false -Dxselinux=false -Dsha1=libsha1 -Dtests=false -Ddocs=false \
@@ -33,6 +36,7 @@ if [ ! -f "$OUT/build/build.ninja" ]; then
         -Dvgahw=false -Ddefault_font_path=built-ins -Dlisten_tcp=false \
         -Dxkb_dir=/boot/share/X11/xkb -Dxkb_output_dir=/tmp -Dlog_dir=/tmp
 else
-    meson configure "$OUT/build" -Dmitshm=true -Ddri3=true >/dev/null   # trees configured before MIT-SHM or DRI3 were on
+    # trees configured before MIT-SHM, DRI3 or GLX were on
+    meson configure "$OUT/build" -Dmitshm=true -Ddri3=true -Dglx=true -Dglx_dri=false >/dev/null
 fi
 ninja -C "$OUT/build"

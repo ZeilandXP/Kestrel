@@ -2,7 +2,7 @@
 # ports/xlibre/apply-patches.sh
 xkestrel_server = executable(
     'Xkestrel',
-    ['kestrel.c', 'kdri3.c', '../../mi/miinitext.c', '../../mi/miinitext.h'],
+    ['kestrel.c', 'kdri3.c', 'kglx.c', '../../mi/miinitext.c', '../../mi/miinitext.h'],
     include_directories: inc,
     dependencies: common_dep,
     link_with: [
@@ -11,6 +11,8 @@ xkestrel_server = executable(
         libxserver,
         libxserver_xkeyboard_stubs,
         libxserver_xi_stubs,
+        libxserver_glx,
+        libglxvnd,
     ],
     install: true,
 )

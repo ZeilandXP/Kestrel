@@ -95,6 +95,7 @@ struct netif {
     bool    (*pending)(struct netif *nif);
     bool    (*link_up)(struct netif *nif);
     size_t  (*info)(struct netif *nif, char *buf, size_t cap);   /* /proc/net/nic: the driver's view; may be NULL */
+    bool      irq;                  /* the card interrupts (MSI): the tick does not poll it */
     void     *priv;
     /* counters (/proc/net/dev) */
     uint64_t  rx_packets, rx_bytes, rx_dropped, rx_errors;
@@ -120,6 +121,8 @@ void virtio_net_probe(void);
 void e1000_probe(void);
 void rtl8139_probe(void);
 void rtl8169_probe(void);
+void usbnet_scan(void);                 /* drivers/net/usbnet.c: USB tethering; the usbd thread */
+void net_hotplug(struct netif *nif);    /* a card that came after boot: up, and DHCP (as net_init) */
 
 /* ---- routing ---------------------------------------------------------------- */
 struct route { uint32_t dst, mask, gw; struct netif *nif; bool used; };
@@ -175,8 +178,8 @@ bool dhcp_busy(void);
 void dhcp_stop(struct netif *nif);       /* user space configures nif itself now */
 
 void net_proc_init(void);
-size_t tcp_proc(char *buf, size_t cap);
+size_t tcp_proc(char *buf, size_t cap, bool v6);    /* v6: tcp6, the AF_INET6 sockets */
 size_t tcp_snmp(char *buf, size_t cap);         /* the "Tcp:" lines of /proc/net/snmp */
-size_t udp_proc(char *buf, size_t cap);
+size_t udp_proc(char *buf, size_t cap, bool v6);
 
 #endif

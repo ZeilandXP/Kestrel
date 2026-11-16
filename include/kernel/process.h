@@ -21,8 +21,11 @@
  *  returns to ring 3 (after a system call or an interrupt). Blocking calls
  *  give up when a signal is pending, with -ERESTARTSYS (restarted if the
  *  handler has SA_RESTART) or -ERESTARTNOHAND (always EINTR to a handler).
- *  No job control: stop signals are ignored. CPU faults in ring 3 still end
- *  the process at once (status 128 + signal) instead of calling a handler.
+ *  Job control: a stop signal (SIGSTOP, or SIGTSTP, SIGTTIN and SIGTTOU with
+ *  their default action) stops every thread of the process until SIGCONT;
+ *  the parent hears of it through SIGCHLD (CLD_STOPPED, CLD_CONTINUED) and
+ *  wait4's WUNTRACED and WCONTINUED. Terminals send SIGTTIN and SIGTTOU to
+ *  background groups (proc_tty_background).
  * ============================================================================= */
 #ifndef KESTREL_PROCESS_H
 #define KESTREL_PROCESS_H
@@ -76,6 +79,10 @@ struct int_frame;
 #define SI_TKILL        (-6)
 #define CLD_EXITED      1
 #define CLD_KILLED      2
+#define CLD_DUMPED      3
+#define CLD_TRAPPED     4
+#define CLD_STOPPED     5
+#define CLD_CONTINUED   6
 
 /* kernel-internal: never seen by user space */
 #define ERESTARTSYS     512
@@ -107,6 +114,7 @@ void signal_force_info(int sig, const struct ksig_info *info);     /* the same, 
  * when it is the last thread, its whole process does. */
 __attribute__((noreturn)) void signal_die(int sig, bool group, uint64_t rip);
 bool signal_pending(void);                      /* for blocking loops         */
+bool signal_stop_now(void);                     /* only a stop pending: stop, true once continued */
 /* signalfd: take the lowest pending signal of the current thread that is in
  * mask (its own first, then the process'); 0 if none. */
 int  signal_dequeue(uint64_t mask, struct ksig_info *info);
@@ -146,5 +154,13 @@ extern bool g_cad_to_init;     /* reboot(CAD_OFF): Ctrl+Alt+Del is SIGINT to ini
 int     sig_temp_mask(uint64_t umask, uint64_t size);
 void    sig_temp_mask_end(void);
 int64_t sig_tgkill(int64_t tgid, int64_t tid, int64_t sig);
+
+/* Job control for terminals (fs/pty.c): the calling process touched its
+ * controlling terminal, whose foreground group is fg_pgrp, with a read
+ * (SIGTTIN) or a write or settings change (SIGTTOU). 0: go ahead; -EIO; or
+ * -ERESTARTSYS once its process group has been sent the signal. */
+int  proc_tty_background(int fg_pgrp, int sig);
+/* A process group with this id in the caller's session (TIOCSPGRP). */
+bool proc_pgrp_in_session(int pgid, int sid);
 
 #endif

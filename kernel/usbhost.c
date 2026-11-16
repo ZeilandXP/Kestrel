@@ -33,6 +33,8 @@
 #include "xhci.h"
 #include "usb_legacy.h"
 #include "usb_msc.h"
+#include <kernel/net.h>
+#include <kernel/bootinfo.h>
 
 static bool usb_up;
 static int  mouse_x, mouse_y;
@@ -181,7 +183,7 @@ static void console_mouse(const struct usb_mouse_event *ev)
  * so boot-time settling and transfer timeouts work in every phase. */
 static uint64_t now_ms(void) { return time_ms(); }
 
-static const struct xhci_platform kestrel_usb = {
+static struct xhci_platform kestrel_usb = {
     .dma_alloc = dma_alloc,
     .map_mmio  = map_mmio,
     .delay_us  = udelay,
@@ -191,6 +193,7 @@ static const struct xhci_platform kestrel_usb = {
     .on_mouse  = on_mouse,
     .pause     = io_pause,                      /* transfers sleep until their completion event */
     .wake      = io_wake,
+    .net_rx    = net_kick,                      /* a USB network function received (drivers/net/usbnet.c) */
 };
 
 /* Every HOOK_EVERY ticks, big lock held (pit.c): the event ring (the
@@ -243,6 +246,13 @@ void usb_init(void)
 
     mouse_x = (int)g_fb.width / 2;
     mouse_y = (int)g_fb.height / 2;
+    /* kestrel.usbnet=rndis|ecm|ncm: the protocol a device that offers several gets */
+    const char *pref = strstr(g_boot.cmdline, "kestrel.usbnet=");
+    if (pref) {
+        pref += 15;
+        kestrel_usb.net_prefer = !strncmp(pref, "rndis", 5) ? XHCI_NET_RNDIS : !strncmp(pref, "ecm", 3) ? XHCI_NET_ECM :
+                                 !strncmp(pref, "ncm", 3) ? XHCI_NET_NCM : 0;
+    }
     uint64_t t0 = time_ms();
     if (xhci_init(bar->base, &kestrel_usb) < 0) return;
     kprintf("usb: controller up and initial ports settled in %lu ms\n", time_ms() - t0);
@@ -267,6 +277,7 @@ static int usbd_main(void *arg)
     for (;;) {
         xhci_service();                         /* hot-plug + endpoint recovery */
         usb_storage_scan(2000);                 /* new sticks -> /dev/usbN[pM] */
+        usbnet_scan();                          /* phones and USB Ethernet -> usbN */
         task_sleep_ms(50);
     }
     return 0;
@@ -297,9 +308,9 @@ size_t usb_proc(char *buf, size_t cap)
     P("SLOT PORT  ID         KIND      REPORTS  SPEED                  NAME\n");
     for (int i = 0; i < xhci_device_count(); i++) {
         const struct usb_device_info *d = xhci_device(i);
-        static const char *kinds[] = { "other", "keyboard", "mouse", "hub", "storage" };
+        static const char *kinds[] = { "other", "keyboard", "mouse", "hub", "storage", "network" };
         P("%4u %4u  %04x:%04x  %-8s %8u  %-22s %s %s\n", d->slot, d->port, d->vendor, d->product,
-          kinds[d->kind < 5 ? d->kind : 0], d->reports, xhci_speed_name(d->speed),
+          kinds[d->kind < 6 ? d->kind : 0], d->reports, xhci_speed_name(d->speed),
           d->manufacturer, d->product_name);
     }
     P("pointer %d,%d buttons %c%c%c, %u mouse reports, %u key presses\n", mouse_x, mouse_y,

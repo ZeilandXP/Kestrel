@@ -15,7 +15,7 @@ Because I want to prove that vibe-coding operating systems isn't always a bad id
 
 ## Overview
 
-Kestrel (0.3.9, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
+Kestrel (0.3.10, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
 
 Tested in QEMU 9.2 with three boot paths:
 - legacy BIOS from the ISO, using a VBE frame buffer
@@ -217,7 +217,7 @@ Each utility is a separate `int name_main(struct cu_io *io, int argc, char **arg
 | `echo [-n] [-e\|-E]` | Escapes `\n \t \\ \a \b \e \f \r \v \0NNN \c` |
 | `chmod MODE`, `chown USER[:GROUP]` | Octal (`755`) or symbolic (`u+x,go-w`) modes. Names come from `/etc/passwd` and `/etc/group`, or numbers. |
 | `date [+FORMAT]` | The CMOS RTC is read at boot and advanced by the kernel's clock (TSC or HPET). Kestrel has no time zones, so the time is UTC. |
-| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.9`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
+| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.10`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
 | `neofetch` | A falcon in columns 2–28 (silver) and live system information from column 32, never past column 127 (no wrapping). Below it, the 16-colour strip. |
 
 `neofetch` reads every value at run time from these sources:
@@ -399,7 +399,7 @@ Not implemented yet: more than one request in flight, multiple queues, discard a
   1. Port reset: USB2 ports through PR; USB3 ports through link training, with a warm-reset fallback.
   2. Enable Slot, then Address Device with an input context (slot plus EP0). Max packet size starts at 8 for low/full speed, 64 for high speed and 512 for SuperSpeed.
   3. Device descriptor (8 bytes, then Evaluate Context if the max packet size differs, then all 18 bytes), and manufacturer/product strings.
-  4. Configuration bundle, then SET_CONFIGURATION.
+  4. Configuration bundle, then SET_CONFIGURATION. Every configuration is read (up to four): the first with a keyboard, mouse or disk in it is taken, and for network devices, which often offer one protocol per configuration, CDC NCM before CDC ECM before RNDIS (`kestrel.usbnet=rndis`, `ecm` or `ncm` prefers one).
   5. For HID boot interfaces: SET_PROTOCOL(boot) and SET_IDLE(0). One Configure Endpoint adds the interrupt-IN endpoints, with the interval converted per speed. Eight report TRBs are kept queued per endpoint.
 - **HID:**
   - Keyboard reports are compared with the previous report to produce press and release events. Caps Lock is tracked, US-layout ASCII is generated, and the driver repeats held keys itself (500 ms, then 30 per second).
@@ -419,7 +419,7 @@ Not implemented yet:
 - devices behind external hubs (route strings, transaction translators)
 - HID report-descriptor parsing for non-boot devices
 - more than one controller
-- isochronous transfers; the only bulk class driver is mass storage (below)
+- isochronous transfers; the bulk class drivers are mass storage (below) and network functions (USB tethering, under Networking)
 
 ## USB boot strapping and storage discovery
 
@@ -862,13 +862,12 @@ Kestrel runs x86_64 ELF programs in ring 3, statically or dynamically linked (`p
 - **Handlers run on Linux's frame:** a handler gets the standard `rt_sigframe` (siginfo, a ucontext with the saved registers, and the FPU state: the XSAVE area with Linux's `FP_XSTATE_MAGIC1`/`MAGIC2` markers and `UC_FP_XSTATE`, or `fxsave`'s without XSAVE). A handler starts with clean FPU registers, and `rt_sigreturn` restores what the frame holds, changes included, after clearing anything XRSTOR would fault on; `AT_MINSIGSTKSZ` follows the frame's size and returns through musl's `SA_RESTORER` trampoline into `rt_sigreturn`.
 - **When delivery happens:** on every return to ring 3 (after a system call or an interrupt), so a process spinning in user mode can also be killed.
 - **Blocking calls:** pipe and socket I/O, `accept`, tty reads, `/dev/kinput`, `wait4`, `poll`, `select`, `nanosleep` and `sigsuspend` stop waiting when a signal arrives. They return EINTR to a handler, or restart under `SA_RESTART`, as on Linux.
-- **Default actions:** terminate, or ignore for SIGCHLD, SIGCONT, SIGURG and SIGWINCH. There is no job control: stop signals are ignored.
+- **Default actions:** terminate; ignore for SIGCHLD, SIGURG and SIGWINCH; stop for SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU; continue for SIGCONT.
+- **Job control:** a stop stops every thread of the process until SIGCONT or SIGKILL. The parent gets SIGCHLD with `CLD_STOPPED` or `CLD_CONTINUED` (unless `SA_NOCLDSTOP`), and `wait4`'s `WUNTRACED`/`WCONTINUED` and `waitid`'s `WSTOPPED`/`WCONTINUED` report each change once. A call that only a stop interrupted carries on once continued: `nanosleep` sleeps its full time, other blocking calls restart, and futex waits wake as if spuriously. Orphaned process groups ignore the terminal's stop signals, and a group orphaned with a stopped member gets SIGHUP and SIGCONT. On a terminal, a background group that reads gets SIGTTIN; one that writes with `TOSTOP`, or changes the settings or the foreground group, gets SIGTTOU. `/proc/PID/stat` and `status` show stopped processes as `T`, and `stat` has the terminal's foreground group (`tpgid`).
 - **Threads:** the mask and a pending set are per thread; `kill`, the terminal, SIGCHLD and SIGALRM go to the process and are taken by a thread that does not block them; `tgkill` and CPU faults go to one thread.
 - **CPU faults** call the handler if there is one (see "User programs"); a blocked or ignored fault signal still kills.
 
-`user/proctest.c` (`/boot/bin/proctest`) checks all of this in 31 tests: fork isolation, pipes across fork, 16 concurrent children, execve (also of a missing file), posix_spawn, vfork, setsid, handlers, blocked and ignored signals, FPU state across a handler, SIGCHLD, SIGTERM/SIGKILL (also against a child spinning in user mode), EINTR versus `SA_RESTART`, sigsuspend, interrupted nanosleep, SIGPIPE, `alarm` and periodic `setitimer`, `readlink("/proc/self/exe")`, and abort.
-
-Not done yet: job control (stop/continue).
+`user/proctest.c` (`/boot/bin/proctest`) checks all of this in 31 tests: fork isolation, pipes across fork, 16 concurrent children, execve (also of a missing file), posix_spawn, vfork, setsid, handlers, blocked and ignored signals, FPU state across a handler, SIGCHLD, SIGTERM/SIGKILL (also against a child spinning in user mode), EINTR versus `SA_RESTART`, sigsuspend, interrupted nanosleep, SIGPIPE, `alarm` and periodic `setitimer`, `readlink("/proc/self/exe")`, and abort; then 17 job control checks (stop and continue, the `wait` flags, SIGCHLD codes, `SA_NOCLDSTOP`, orphaned groups, SIGTTIN and SIGTTOU, a sleep across a stop).
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
@@ -884,7 +883,7 @@ make usbimg       # stages bin/Xkestrel, bin/xdemo, bin/dri3test, bin/xrandr and
 ```
 
 `ports/xlibre/build.sh` does four things:
-1. Builds the client and server libraries as static musl libraries into `build/xsysroot`: zlib, xorgproto, xtrans, libXau, libXdmcp, xcb-proto, libxcb, libX11, libxkbfile, libfontenc, libXfont2, pixman, the libraries IceWM and xterm use (libXext, libXrender, libXrandr, libXinerama and more), libxshmfence (DRI3's fences) and a small `libsha1`. Ubuntu's `apt-get source --download-only` tarballs work.
+1. Builds the client and server libraries as static musl libraries into `build/xsysroot`: zlib, xorgproto, xtrans, libXau, libXdmcp, xcb-proto, libxcb, libX11, libxkbfile, libfontenc, libXfont2, pixman, the libraries IceWM and xterm use (libXext, libXrender, libXrandr, libXinerama and more), libxshmfence (DRI3's fences), the OpenGL headers (from libglvnd) with a libGL of empty functions for the server's GLX to link against, and a small `libsha1`. Ubuntu's `apt-get source --download-only` tarballs work.
 2. Applies `ports/xlibre/patches` and adds the `kestrel` meson option and `hw/kestrel`.
 3. Cross-builds the server with musl (`kestrel-cross.txt.in`).
 4. Builds the test clients `xdemo` and `dri3test`, `xrandr` (from Ubuntu's x11-xserver-utils), and precompiles the default keymap with the host's `xkbcomp`.
@@ -904,11 +903,13 @@ Host packages: `musl-tools meson ninja-build pkg-config x11-xkb-utils xkb-data`.
 | Fonts | the built-in `fixed` and `cursor` fonts |
 | MIT-SHM | on: System V segments (`ShmAttach`), or a memfd passed with `SCM_RIGHTS` (`ShmAttachFd`) |
 | DRI3 and Present | on when there is a render node (`hw-kestrel/kdri3.c`): linear GPU buffers in system memory, handed over as dma-bufs, become pixmaps over the buffer itself |
-| GLX, DRI1/DRI2, XDMCP, udev, input thread | disabled |
+| GLX | direct rendering only (`hw-kestrel/kglx.c`): the client's Mesa draws |
+| Indirect GLX, DRI1/DRI2, XDMCP, udev, input thread | disabled |
 
 **The DDX** (`hw-kestrel/kestrel.c`) has two halves:
 - **Screens:** one X screen for all monitors (`-screens N` uses only the first N), a 24-bit TrueColor fb screen with RENDER and RandR. Each monitor is a RandR output with its own CRTC, named after its connector (`DP-1`, `HDMI-A-1`) or else `fbN`. The monitors start side by side, left to right in `/dev/fbN` order with their tops aligned, the first one primary, so they form one desktop. `xrandr` (in `/boot/bin`) can then move (`--pos`, `--left-of`, `--right-of`), mirror (`--same-as`), rotate and reflect (`--rotate`, `--reflect`), switch off (`--off`, `--auto`) and choose the primary (`--primary`); the screen grows and shrinks to fit. A monitor whose kernel driver can switch modes lists them all, and `--mode`/`--rate` switch it (`KFB_GET_MODES`, `KFB_SET_MODE`); the others list only their current mode. The server answers Xinerama queries from RandR, so Xinerama-only clients see the same monitors. A damage listener on the root pixmap collects changes, and a wrapped screen BlockHandler pushes each changed box to every monitor showing it before the server sleeps, after the software cursor has been drawn back; rotated and reflected monitors get the box turned in a scratch buffer first. `ports/xlibre/patches/0003` also fixes the order in which XLibre's own Xinerama (`+xinerama`, for several X screens) lists them.
 - **Input:** a read notification on `/dev/kinput` feeds keys, buttons, relative motion and the wheel (as buttons 4 and 5) into the dix event queue.
+- **GLX** (`hw-kestrel/kglx.c`), for programs that draw with OpenGL through GLX: `glxgears`, `glxinfo`, SDL's OpenGL windows and many games and toolkits. Even a program that renders by itself needs the server's GLX, because libGL asks it for the version, the extensions and the fbconfigs, and has it make the context and drawable ids. Rendering stays in the client: Mesa (llvmpipe, since `/bin/startx` sets `LIBGL_ALWAYS_SOFTWARE=1`) draws into its own memory and shows each frame with MIT-SHM or `PutImage`. The server itself has no OpenGL, so the provider only makes indirect contexts fail, which XLibre refuses by default anyway; it offers the fbconfigs Mesa's drivers have (8-bit RGB with and without alpha, single and double buffered, no depth or 16- or 24-bit depth with or without an 8-bit stencil, sRGB-capable or not, and copies for Composite's 32-bit visual), names the vendor `mesa` for libglvnd, and lists the GLX extensions Mesa offers for direct contexts (`GLX_ARB_create_context` and its profiles, `GLX_EXT_texture_from_pixmap`, `GLX_MESA_copy_sub_buffer` and others). The GL code that indirect GLX carries is linked against the sysroot's libGL of empty functions and never runs.
 - **DRI3** (`hw-kestrel/kdri3.c`), so that Vulkan on a GPU can show its frames: Mesa's Vulkan drivers for a GPU (NVK, for one) present on X11 only through DRI3 and Present, and closed the X connection on a server without them. The screen has DRI3 when the machine has a render node (`/dev/dri/renderD128` on). `DRI3Open` answers with `/dev/null` rather than the GPU, because the screen lives in the CPU's memory: told the GPU, Mesa presents images in video memory, which the CPU reads across PCIe uncached (on the Quadro P2000 a full-screen game and the desktop with it fell to 2 frames per second); told another device, Mesa has the GPU copy each frame into a linear buffer in system memory, which the server reads at memory speed. `DRI3GetSupportedModifiers` offers only `DRM_FORMAT_MOD_LINEAR` for 24- and 32-bit pixmaps, so the buffers the client hands over are plain linear images. `DRI3PixmapFromBuffers` maps the dma-buf into the server and makes a pixmap whose pixels are the buffer itself; fb reads it like any other pixmap. Before each copy or composite from such a pixmap (the screen's `SourceValidate`), `DMA_BUF_IOCTL_SYNC` waits for the fences on the buffer, which is where Mesa puts its rendering's fence when it presents. Present's idle fences are shared-memory futexes (`miSyncShm`, libxshmfence, the same layout as Mesa's). Present has no vblank of its own here: it copies at a fake 60 Hz. `/bin/startx` sets `LIBGL_DRI3_DISABLE=1` and `LIBGL_ALWAYS_SOFTWARE=1` for the Xkestrel session, so OpenGL keeps rendering with llvmpipe as before rather than on a GPU driver that would hand over buffers the CPU cannot read (virgl's live on the host). The second also keeps Firefox on software WebRender: Firefox finds the GPU through DRI3 by itself, and on the Quadro P2000 it chose nouveau and showed only a black window. `dri3test` checks it with a dumb buffer exported as a dma-buf: the version, that `DRI3Open` gives no GPU, the modifiers, a pixmap from the buffer copied to a window and read back, and 120 `PresentPixmap`s with an idle fence, each completing, going idle and triggering the fence.
 
 Exiting the server returns its monitors to their text terminals.
@@ -916,11 +917,12 @@ Exiting the server returns its monitors to their text terminals.
 **Trying it:**
 - Interactively: `run Xkestrel :0` in a terminal.
 - Unattended, with the test client: boot with `kestrel.exec=/boot/bin/Xkestrel,:0+/boot/bin/xdemo`. xdemo opens a window, draws rectangles, a line and text, redraws every second, and logs its key and button events to the kernel log.
+- OpenGL: with an Ubuntu root (the Firefox image's), `LIBGL_ALWAYS_SOFTWARE=1 glxinfo -B` on Xkestrel says "direct rendering: Yes" with llvmpipe (OpenGL 4.5, OpenGL ES 3.2), and `glxgears` draws at about 55 frames per second in QEMU without KVM (2 CPUs).
 - In QEMU: this has been checked with an xHCI keyboard and mouse. The window appears, the pointer moves, and clicks and keys (including Shift) reach the client with the expected evdev keycodes.
 
 As the X protocol requires, the pointer stays hidden until some client defines a cursor; normally that is the window manager's job, and xdemo does it for its test.
 
-**Not yet:** GLX in the server (OpenGL programs use EGL with Mesa's llvmpipe instead), tiled or multi-plane DRI3 buffers, page flips, keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
+**Not yet:** indirect GLX (OpenGL drawn by the server), OpenGL on the GPU under Xkestrel (Xorg has it), tiled or multi-plane DRI3 buffers, page flips, keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
 
 ## IceWM (`ports/icewm/`)
 
@@ -965,7 +967,7 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 - **Devices:** opening `/dev/ptmx` gives a new master; its slave is `/dev/pts/N` (16 pairs). The text terminals use one pair each, from the top (`/dev/pts/15` down): their slave is `/dev/ttyN` (see "The shell on the terminals").
 - **Line discipline:** canonical editing (erase, word erase, kill, EOF), echo with `^X` for control characters, `ICRNL`/`INLCR`/`IGNCR`, output `OPOST`/`ONLCR`, and raw mode with `VMIN`/`VTIME`.
 - **Controlling terminal:** set with `TIOCSCTTY`, or when a session leader opens a slave. `/dev/tty` then opens it; `TIOCGPGRP`/`TIOCSPGRP` set the foreground process group.
-- **Signals:** Ctrl+C, Ctrl+\ and Ctrl+Z send SIGINT, SIGQUIT and SIGTSTP to the foreground group (SIGTSTP is ignored: no job control). `TIOCSWINSZ` sends SIGWINCH. Closing the master sends SIGHUP to the session.
+- **Signals:** Ctrl+C, Ctrl+\ and Ctrl+Z send SIGINT, SIGQUIT and SIGTSTP to the foreground group, so a shell's job control works (Ctrl+Z, `jobs`, `fg`, `bg`). `TIOCSWINSZ` sends SIGWINCH. Closing the master sends SIGHUP to the session.
 - **Hang-up:** after the slave side closes, master reads fail with EIO (as on Linux).
 - **Packet mode:** `TIOCPKT` on the master puts a status byte in front of every read, as on Linux: 0 (`TIOCPKT_DATA`) before the slave's output, or alone, `TIOCPKT_FLUSHREAD`/`TIOCPKT_FLUSHWRITE` after the slave side flushes its queues (`tcflush`, `TCSETSF`, Ctrl+C), which poll reports as `POLLPRI`. VTE turns it on before it starts the shell, and gives up without it, so LXTerminal needs it.
 - **Test:** `user/ptytest.c` checks all of this in 22 tests.
@@ -995,7 +997,7 @@ make usbimg
 
 **Checked in QEMU** with an xHCI keyboard and mouse: commands typed into the shell run, including pipes, `ps`, `top` and `stty size`; Ctrl+C interrupts a running `sleep`; `exit` closes the window, and IceWM reaps xterm.
 
-**Not yet:** fonts other than `fixed`, job control (Ctrl+Z, `fg`/`bg`), and a writable disk to keep files across reboots; `/tmp` and the root file system are in RAM.
+**Not yet:** fonts other than `fixed`, and a writable disk to keep files across reboots; `/tmp` and the root file system are in RAM.
 
 ## SysVinit (`ports/sysvinit/`)
 
@@ -1100,12 +1102,14 @@ What it supports:
 How it handles everything else:
 - Directories with an htree index (`dir_index`) are read linearly. A directory Kestrel changes loses its index flag, as `e2fsck` expects from a kernel without htree support.
 - Unknown read-only-compatible features (metadata checksums, huge files, ...) mount read-only.
-- Extents (ext4), 64-bit block numbers, journals that need recovery and compression are refused.
+- Stock ext4 volumes (as `mkfs.ext4` makes them: extents, 64bit, flex_bg, metadata_csum, huge_file, dir_nlink, extra_isize) mount read-only, so an ext4 root or data disk from a Linux install can be read. Files and directories mapped by an extent tree are looked up through it, at any depth; extents allocated but not written yet read as zeros. 64-byte group descriptors work as long as block numbers fit in 32 bits (16 TiB at 4 KiB blocks). `/proc/mounts` calls such a volume `ext4`.
+- Journals that need recovery (run `e2fsck` first), meta_bg, inline data, encryption and compression are refused.
 
 How it works:
 - **Inodes:** hard links share one in-memory copy of the raw on-disk inode, so fields Kestrel does not interpret survive a write.
 - **Write-back cache:** metadata and data go through a block cache (4 MiB per volume). A kernel thread writes dirty blocks every 5 seconds; `sync`, `fsync`, `poweroff` and `reboot` write everything.
 - **Page cache** (`mm/pagecache.c`): regular files are read through it, page by page. A page comes from the disk on first use, with its neighbours that are not cached yet and whose blocks follow on the disk, all in one request; a block the block cache holds is copied from there, as it may be newer. A page fault reads the aligned 128 KiB around it, so runs never overlap in part. A file read in order with `read()` is read ahead in a window that doubles from 128 KiB to 1 MiB; page faults never grow it. `readahead()`, `fadvise(WILLNEED)` and `madvise(MADV_WILLNEED)` read the first 1 MiB of the range at once and no more, as Linux caps them too. Firefox asks for all of `libxul.so` (187 MB) and both `omni.ja` files, of which it uses about half at start-up. With this cap a cold Firefox start reads 200 MB from the stick, the same as Linux 6.8. `mincore()` reports a file page as resident when the page cache holds it, mapped or not, as on Linux. Private mappings, which is to say every program and library, map the cached frames themselves, read-only: all the processes running Firefox share one copy of `libxul.so`, and only a write to a private mapping makes a copy of a page. A file fault also maps the neighbours already cached in its 64 KiB. Writes update cached pages as they go to the block cache, so the cache never needs writing back, and when memory runs low the least recently used files lose the pages nobody maps; `/proc/meminfo` counts them as `Cached` and in `MemAvailable`.
+- **Shared writable mappings:** `MAP_SHARED` of a file maps the page cache's frames themselves, writable, so `read()` and `write()` see a mapping's bytes at once and the other way round, and every process mapping the file shares one copy. A write through a mapping leaves only the dirty bit the CPU sets in the page table; at each write-back (every 5 seconds, `sync`, `fsync`, `msync(MS_SYNC)`, shutdown) and when a mapping goes (`munmap`, exit), those bits are handed to the page cache, which keeps dirty pages until the file system has written them through the block cache like `write()` would, allocating blocks for holes and stopping at the end of the file. `mprotect` keeps the bits. A page wholly past the end raises `SIGBUS`; `PROT_WRITE` needs a descriptor open for writing (`EACCES`), and so does adding it later with `mprotect`.
 - **Clean flag:** the superblock is marked clean only at shutdown, like an unmount on Linux, so `e2fsck` checks a volume that was not shut down cleanly.
 - **Untrusted disk:** nothing on it is trusted. Block numbers are range-checked before any I/O, and directory records are validated. A corrupt structure gives `EIO`, not a kernel fault.
 - **Free blocks:** new blocks come zeroed, so no stale data reaches a file, and an unlinked file that is still open keeps its blocks until the last close.
@@ -1120,16 +1124,19 @@ How it works:
 - **Record locks** (`fs/lockf.c`): `fcntl` read and write locks on byte ranges, POSIX (owned by the process, dropped when it closes any descriptor of the file) and open-file-description (`F_OFD_*`, dropped with the open file). SQLite, and with it Firefox's profile, depends on them.
 
 **Tests:**
-- `fstest` (in `/bin` on the root volume) runs 100 checks:
+- `fstest` (in `/bin` on the root volume) runs 115 checks:
   - files in every block-map class, sparse files, truncation, `O_APPEND`;
   - fast and slow symbolic links, link loops, `O_NOFOLLOW`;
   - hard links, renames of files and directories (and `..`), 400-entry directories;
   - unlinked open files, `chmod`/`chown`, `flock` and the extended-attribute calls;
   - inotify: create, modify (queued once), attribute, close, move with a shared cookie, delete, delete-self, `IN_IGNORED`, `IN_ONLYDIR`, `FIONREAD`;
+  - shared writable mappings: holes, `read()`/`write()` coherence both ways, `msync` allocating blocks, a forked child's writes, two mappings of one page, a private mapping beside them, `mprotect`, `SIGBUS` past the end, `EACCES`, a 3 MiB file synced while mapped;
   - `fcntl` record locks between two processes (conflicts, `F_GETLK` reporting the holder, `F_SETLKW` waiting, release on any close), `waitid` with `WNOWAIT`, reopening a descriptor through `/proc/self/fd`, memfd seals;
   - free space returning exactly to where it started.
-- `fstest -r` writes files, restarts the machine, and checks them after the reboot.
+- `fstest -r` writes files, restarts the machine, and checks them after the reboot, including one written through a mapping and one still mapped at the restart.
+- `fstest -a` writes a file through a mapping and never syncs; killing QEMU 12 seconds later, the file on the image (read with `debugfs`) holds every byte, written by the periodic write-back alone.
 - After each run, `e2fsck -fn` on the image finds no errors. This holds with 4 KiB blocks and 256-byte inodes, and with 1 KiB blocks and 128-byte inodes.
+- ext4: a 600 MB volume from a stock `mkfs.ext4 -d` boots as the root (`kestrel.rootfs=LABEL=...`, read-only). The checksums of a 50 MB file, a 300 MB sparse file and a file of 2000 separate extents (a tree of depth 2) match the host's, a 3000-entry directory (with its htree) lists in full, slow symbolic links read back, and writes fail with `EROFS`.
 
 **Alpine Linux as the root.** Alpine's own minirootfs (3.24.2, from the official `alpinelinux/docker-alpine` repository) runs unmodified on Kestrel. The images can be built on it:
 
@@ -1149,8 +1156,7 @@ Alpine on another disk works too: put it on an ext2 partition, label it, and boo
 - A whole disk without a partition table is mounted read-only; a partition is mounted read-write.
 
 **Not yet:**
-- Shared writable `mmap` of disk files (read-only shared mappings work).
-- ext4 extents.
+- Writing to ext4 volumes that use extents (they mount read-only).
 - Device nodes, FIFOs and sockets on disk (`/dev` is devfs).
 - `mount(2)` for other volumes.
 
@@ -1162,11 +1168,12 @@ Alpine on another disk works too: put it on an ext2 partition, label it, and boo
 - **UDP:** broadcast (with `SO_BROADCAST`), multicast delivery to every matching socket, `connect` for a fixed peer, ICMP errors reported to connected sockets.
 - **TCP:** window scaling and the MSS option, RTO per RFC 6298 with Karn's rule, slow start, congestion avoidance and NewReno fast recovery, SACK blocks in its ACKs (RFC 2018) so a sender resends only the segments that were lost, delayed ACKs, Nagle (`TCP_NODELAY`), zero-window probes, keepalive, `SO_LINGER`, half-close, `TIME_WAIT`, RST on close with unread data, and RFC 5961 challenge ACKs. Send and receive buffers start at 128 KiB per connection and double, up to 4 MiB, while a connection moves more than half of one per round trip, as Linux's autotuning does. A fixed 128 KiB window held a download to 40 Mbit/s at a 26 ms round trip; 4 MiB allows 1.2 Gbit/s.
 - **Sockets:** blocking and non-blocking (`connect` returns `EINPROGRESS`), with `poll`/`select`/`epoll`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, `SO_REUSEADDR`, `SO_ERROR`, ephemeral ports 32768–60999. Raw ICMP sockets and unprivileged ping sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`) are there for `ping`; `IPPROTO_RAW` sockets send IP packets whose header the program writes.
+- **IPv6 sockets:** `AF_INET6` TCP and UDP sockets are dual-stack sockets on the IPv4 stack, the way programs that open only IPv6 sockets expect a dual-stack host to behave. A socket bound to `::` takes IPv4 connections and datagrams, whose addresses come back IPv4-mapped (`::ffff:10.0.2.2`, in 28-byte `sockaddr_in6`s from `accept`, `recvfrom`, `recvmsg`, `getsockname` and `getpeername`); `::ffff:a.b.c.d` reaches `a.b.c.d`; `::1` is the loopback, shown as `::1` to both ends when both are IPv6 sockets. `IPV6_V6ONLY` (set before `bind`) refuses mapped addresses and lets a `[::]` socket share its port with an IPv4 socket on `0.0.0.0`, as servers that open one of each do (the IPv4 one gets the IPv4 traffic). `IPV6_UNICAST_HOPS` and `IPV6_TCLASS` set the TTL and TOS; the other common `IPPROTO_IPV6` options are accepted. The sockets are listed in `/proc/net/tcp6` and `/proc/net/udp6`. Any other IPv6 address is unreachable (`ENETUNREACH`; `EADDRNOTAVAIL` to bind), so a program that tries its IPv6 addresses first falls back to IPv4.
 - **Netlink** (`net/netlink.c`): `NETLINK_ROUTE` sockets, which `ip` and the C library's `getifaddrs()` and `if_nameindex()` use. Dumps and lookups of links (with their counters), IPv4 addresses, routes (`ip route get` too), neighbours (the ARP cache) and the three standard rules; requests that set a link up or down, change its MTU or name, add and remove addresses and routes, and forget neighbours. Changes are announced to the `RTMGRP_LINK`, `RTMGRP_IPV4_IFADDR` and `RTMGRP_IPV4_ROUTE` groups. Changing anything needs root.
 - **Packet sockets** (`net/packet.c`, root only): `SOCK_RAW` (whole Ethernet frames) and `SOCK_DGRAM` (the payload), for one protocol or `ETH_P_ALL`, bound to one card or all, seeing frames in both directions, with classic BPF filters (`SO_ATTACH_FILTER`) checked when they are attached. DHCP clients such as `udhcpc` use them.
 - **Loopback:** `lo` (127.0.0.1/8, MTU 16436).
 
-**How it runs.** A kernel thread, `netd`, receives frames, runs the ARP, TCP and DHCP timers and sleeps until the next deadline. Most cards are polled: on every 1 kHz tick the boot CPU checks one descriptor bit per card and wakes `netd` when a frame has arrived, so an idle network costs one memory read per millisecond. The Realtek RTL8168 family interrupts by MSI instead, which wakes `netd` at once. System calls send directly.
+**How it runs.** A kernel thread, `netd`, receives frames, runs the ARP, TCP and DHCP timers and sleeps until the next deadline. Cards that can interrupt by MSI do (virtio-net through MSI-X, the PCIe Intel 8257x such as QEMU's `e1000e`, and the Realtek RTL8168 family), which wakes `netd` at once. The rest (RTL8139, the PCI Intel 8254x, the PCI RTL8169) are polled: on every 1 kHz tick the boot CPU checks one descriptor bit per card and wakes `netd` when a frame has arrived, so an idle network costs one memory read per millisecond. System calls send directly.
 
 **Configuration.** A DHCP client (RFC 2131) runs on every Ethernet card it finds at boot. It applies the address, netmask, default route (the first card to get a lease keeps it), name servers, domain and MTU, and renews the lease at T1 and T2. `/etc/resolv.conf` is a symbolic link to `/proc/net/pnp`, which lists the name servers, so musl's resolver (and BusyBox `nslookup`, `wget`) find them. Boot options:
 - `kestrel.net=dhcp` (default) or `kestrel.net=off`.
@@ -1187,17 +1194,25 @@ BusyBox `ifconfig`, `route`, `netstat`, `arp`, `ping`, `nc`, `wget`, `httpd` and
 - **r8169:** the chip version is read from `TxConfig` as Linux does; it decides the receive configuration, the transmit FIFO mode, and whether the PHY is reached through `PHYAR` or (8168G on) the GPHY OCP window. The PLL, the PHY and the RXDV gate are powered back up in case a previous driver shut them down, and the PHY is told to advertise every speed the part has (10/100 half and full, 1000 full, pause) before autonegotiation restarts: firmware and systems that went to sleep with Wake-on-LAN often leave it offering 10 Mbit/s only. The negotiated speed and duplex are logged (`r8169: eth0: link up, 1000 Mbit/s, full duplex`), and `IFF_RUNNING` follows the cable. Energy Efficient Ethernet is not advertised (8168G on), and PCIe power saving is turned off as Linux does (ASPM L0s/L1 on both ends of the card's link, the chip's own ASPM and clock request): both are known to make these chips drop frames. `cat /proc/net/nic` shows what the driver sees: the link, the PHY registers (what was advertised and what the switch offered), whether firmware had ASPM on, and the chip's own counters (missed frames, receive errors, collisions). Rings of 256 descriptors hold more than a whole TCP window at a gigabit; received frames and link changes interrupt by MSI (the old PCI RTL8169s are polled, as Linux keeps them off MSI), and ring overruns are counted as dropped frames. Linux also loads per-version PHY tuning tables, which this driver does not. The 2.5 and 5 gigabit RTL8125/8126 are a different design and are refused with a message.
 - Each card gets a ring of receive and transmit descriptors with 2 KiB buffers (RTL8139: an 8 KiB receive ring and four transmit slots, below 4 GiB). Cards are named `eth0`, `eth1`, ... in the order they are found: virtio-net, e1000, r8169, rtl8139.
 
-**Tests:** `nettest` (in `/boot/bin`) runs 75 checks:
+**USB tethering** (`drivers/net/usbnet.c`). A phone with USB tethering switched on, a USB Ethernet adapter or a Linux USB gadget becomes `usb0` (then `usb1`, up to four) and gets an address by DHCP like any card; unplugging it takes the link down (`IFF_RUNNING`), and the next device plugged in takes the interface back with its own MAC address and a new lease. Three protocols:
+- **RNDIS**, what Android phones speak: the device is initialised with RNDIS control messages (`INITIALIZE`, queries of the MAC address and frame size, the packet filter), and each frame travels in a 44-byte packet message; several in one transfer are taken apart.
+- **CDC ECM**, plain Ethernet frames (many USB Ethernet adapters, gadgets, some modems): the MAC address comes from the descriptor's string, the data interface's second alternate setting is selected and the packet filter set.
+- **CDC NCM**, frames gathered in 16-bit transfer blocks (newer phones and adapters): the block parameters are read, blocks the device sends are capped at 16 KiB, and the datagrams of each block (chained NDPs too) are delivered; frames go out one per block, placed where the device's divisor and remainder ask.
+
+The xHCI driver keeps sixteen 16 KiB receive transfers queued on the bulk IN endpoint and up to 32 frames in flight on the OUT one; a transfer's completion wakes `netd` at once, and a halted endpoint is reset and restarted by `usbd`. `/proc/net/nic` shows each device's protocol, product name and counters. Tested in QEMU with `-device qemu-xhci -device usb-net` both ways (it offers RNDIS and CDC ECM): `nettest` passes through it, and a device removed and added again from the QEMU monitor comes back as `usb0`. QEMU has no NCM device, so NCM is checked on the build machine by `make test-usbnet` (blocks built and taken apart, malformed ones refused); it has not met a real phone yet. Apple's iPhone tethering protocol is not supported.
+
+**Tests:** `nettest` (in `/boot/bin`) runs 105 checks on loopback:
 - interfaces, `SIOC*` ioctls and `if_nametoindex`;
 - netlink: `getifaddrs`, `if_nameindex`, link and address dumps, `MSG_PEEK | MSG_TRUNC`, errors and acknowledgements, a change heard by an `RTMGRP_LINK` listener; packet sockets: a BPF program that jumps out of bounds is refused;
 - UDP on loopback, including 40 KB fragmented datagrams, `MSG_TRUNC` and ICMP port unreachable (`ECONNREFUSED`);
 - TCP: half-close, RST on unread data, `ECONNREFUSED`, `EADDRINUSE`, non-blocking connect with `epoll`, `/proc/net/tcp`, and 8 MiB echoed through loopback with a checksum;
-- `nettest HOST:PORT` also waits for DHCP, pings the gateway (as root also through an ICMP-only BPF filter on a packet socket, and watching the request leave on an `ETH_P_ALL` one), echoes 8 MiB of TCP and 20 UDP datagrams through the card with a server on the host, and checks `/etc/resolv.conf`;
+- `AF_INET6`: an IPv4 client and an IPv6 one (to `::1`) accepted by one `[::]` listener with their addresses mapped or `::1`, mapped destinations, unreachable IPv6 addresses, `IPV6_V6ONLY` beside an IPv4 listener on the same port, UDP both ways with mapped and `::1` senders, `/proc/net/tcp6` and `udp6`;
+- `nettest HOST:PORT` also waits for DHCP (on `eth0`, or `usb0` when there is no card), pings the gateway (as root also through an ICMP-only BPF filter on a packet socket, and watching the request leave on an `ETH_P_ALL` one), echoes 8 MiB of TCP and 20 UDP datagrams through the card with a server on the host, connects an `AF_INET6` socket to the host's v4-mapped address, and checks `/etc/resolv.conf`;
 - `nettest serve PORT` takes a connection from the host (QEMU `hostfwd`) and answers with the byte count and checksum.
 
 In QEMU (TCG, no KVM) on loopback: 200 one-byte TCP round trips take about 60 ms and bulk TCP runs at about 11 MiB/s each way; through the card, ping to the host is 2–4 ms and TCP 5–7 MiB/s each way.
 
-**Not yet:** IPv6, TCP selective acknowledgement (SACK) and timestamps, IP forwarding, interrupts for cards other than the RTL8168 family, checksum and segmentation offload, `SO_REUSEPORT` load balancing, `ip -s` and `ip monitor` (BusyBox's `ip` has neither), more than one IPv4 address per card, and noticing an unplugged cable on cards other than the Realtek RTL8169/8168 (DHCP keeps asking until it gets an answer, so a cable plugged in after boot does work).
+**Not yet:** IPv6 on the wire (no IPv6 addresses, neighbour discovery, ICMPv6 or SLAAC: IPv6 sockets reach IPv4 hosts only), TCP selective acknowledgement (SACK) and timestamps, IP forwarding, interrupts for the cards without MSI, checksum and segmentation offload, `SO_REUSEPORT` load balancing, `ip -s` and `ip monitor` (BusyBox's `ip` has neither), more than one IPv4 address per card, and noticing an unplugged cable on cards other than the Realtek RTL8169/8168 (DHCP keeps asking until it gets an answer, so a cable plugged in after boot does work).
 
 ## Sound: HD Audio (`drivers/sound/hda.c`)
 
@@ -1207,11 +1222,15 @@ Intel High Definition Audio, the sound hardware of nearly every PC since 2004, w
 
 **Codecs.** Each codec's audio function group is reset and powered up, then every widget is read: capabilities, connection lists (short and long form, ranges), pin capabilities and configuration defaults, amplifier capabilities and supported rates. Outputs are chosen from the pin configuration in this order: speaker, headphones, line out; jacks the firmware marks as unconnected are skipped. From each pin a path to a DAC is found through mixers and selectors; the path is selected, its input amplifiers unmuted and its output amplifiers set to 0 dB. Pins get their output and headphone enables and EAPD (the external amplifier switch Realtek codecs need on laptops). Realtek codecs are named in the log as `Realtek ALCxxx`.
 
-**Playback.** One output stream with a 64 KiB ring in 8 buffer descriptors, polled every 4 ms by the `hdad` thread through the DMA position buffer (or the link position register when the buffer stays still). Played parts of the ring are cleared, so an underrun plays silence, and the stream stops a second after the last writer closes and the ring runs dry.
+**Inputs.** The first input pin the board wires up, in this order: microphone, line in, anything else that takes input. A path from it to an analog ADC is found through mixers and selectors, selected and unmuted at 0 dB, and the pin's input is enabled, with bias voltage (80%, or 50%) for a microphone.
 
-**`/dev/dsp`** (OSS, `14,3`): unsigned 8-bit, signed 16-bit and 32-bit little-endian samples, mono or stereo (mono is doubled), any rate from 4 kHz to 192 kHz. Rates the codec lacks are converted (linear interpolation) and the hardware runs at 48 kHz. Writes block until there is room, or return `EAGAIN` with `O_NONBLOCK`; `poll` works. The usual ioctls: `SNDCTL_DSP_RESET`, `SYNC`, `POST`, `SPEED`, `SETFMT`, `CHANNELS`, `STEREO`, `GETBLKSIZE`, `SETFRAGMENT`, `SUBDIVIDE`, `GETFMTS`, `GETOSPACE`, `GETODELAY`, `GETOPTR`, `GETCAPS`, `GET/SETTRIGGER`, `NONBLOCK`, `OSS_GETVERSION`. One writer at a time (`EBUSY`); there is no capture yet (`ENODEV` for reading).
+**Streams.** One output and one input stream, each a 64 KiB ring in 8 buffer descriptors, polled every 4 ms by the `hdad` thread through the DMA position buffer (or the link position register when the buffer stays still). Played parts of the output ring are cleared, so an underrun plays silence; the output stops a second after the last playback client closes and the ring runs dry, the input when the last capture client closes.
 
-**`/dev/mixer`** (`14,0`): master and PCM volume (0 to 100, mapped onto the output amplifiers' steps up to 0 dB), plus the device masks and `SOUND_MIXER_INFO`. `/proc/sound` shows the controller, codecs, chosen outputs and the stream's state.
+**Mixing.** Every open of `/dev/dsp` is a client with its own format, rate and positions, up to 8 at once. Playback clients add their samples into the output ring at their own write positions, ahead of the hardware, saturating at the 16-bit limits, so several programs play at once without a sound server. The hardware runs at one rate per direction: a client alone in its direction gets the codec running at its own rate when the codec has it (no conversion), and the others are converted to the rate the stream already runs at.
+
+**`/dev/dsp`** (OSS, `14,3`): unsigned 8-bit, signed 16-bit and 32-bit little-endian samples, mono or stereo, any rate from 4 kHz to 192 kHz, for writing and reading. Rates the stream does not run at are converted (linear interpolation). `O_WRONLY` plays, `O_RDONLY` records (`ENODEV` if the codec has no input), `O_RDWR` does both. Writes block until there is room and reads until all of the request has come in, or return `EAGAIN` with `O_NONBLOCK`; `poll` reports `POLLOUT` and `POLLIN`. Each capture client reads the input ring from its own position; one that falls more than about 300 ms behind skips ahead (an overrun). Mono capture is the average of the two channels. The usual ioctls: `SNDCTL_DSP_RESET`, `SYNC`, `POST`, `SPEED`, `SETFMT`, `CHANNELS`, `STEREO`, `GETBLKSIZE`, `SETFRAGMENT`, `SUBDIVIDE`, `GETFMTS`, `GETOSPACE`, `GETISPACE`, `GETODELAY`, `GETOPTR`, `GETIPTR`, `GETCAPS` (with `DSP_CAP_DUPLEX` when there is an input), `GET/SETTRIGGER`, `NONBLOCK`, `OSS_GETVERSION`. `SYNC`, `GETODELAY` and `GETOPTR` are per client; `RESET` drops a client's queued sound from the ring only when it plays alone (mixed, it is already part of the sum).
+
+**`/dev/mixer`** (`14,0`): master and PCM volume (0 to 100, mapped onto the output amplifiers' steps up to 0 dB), the recording source (`SOUND_MASK_MIC` or `SOUND_MASK_LINE`, whichever input was found), the device masks and `SOUND_MIXER_INFO`. `/proc/sound` shows the controller, codecs, chosen outputs and input, and both streams' state and clients.
 
 **ALSA programs** (`aplay`, `speaker-test`) use the ALSA library's OSS plugin from `libasound2-plugins`, with this `/etc/asound.conf`:
 
@@ -1223,7 +1242,7 @@ ctl.!default { type oss device /dev/mixer }
 **PulseAudio programs**, Firefox among them (Mozilla's builds have no ALSA backend), go through PulseAudio 16 with its OSS module on `/dev/dsp`. `tools/mkfirefoxroot.sh` writes this as `/etc/pulse/kestrel.pa`:
 
 ```
-load-module module-oss device=/dev/dsp sink_name=kestrel playback=1 record=0 mmap=0
+load-module module-oss device=/dev/dsp sink_name=kestrel source_name=kestrel-in playback=1 record=1 mmap=0
 load-module module-native-protocol-unix auth-anonymous=1
 load-module module-always-sink
 set-default-sink kestrel
@@ -1231,9 +1250,11 @@ set-default-sink kestrel
 
 `pulseaudio -n -F /etc/pulse/kestrel.pa --exit-idle-time=-1` starts it; `paplay`, `pactl` and Firefox's Web Audio then play, at 44.1 kHz converted to the codec's 48 kHz.
 
-**Test:** `sndtest` (in `/boot/bin`) checks the mixer, exclusive open, every format, 1.5 s of 440 Hz at 48 kHz with `SYNC` timing, the delay and pointer ioctls, non-blocking writes and `poll`, `RESET`, 8 kHz mono through the rate converter, and 44.1 kHz 32-bit audio written in odd-sized pieces. `sndtest file.wav` plays a WAV file. In QEMU (`-device intel-hda -device hda-output` or `ich9-intel-hda` with `hda-duplex`, recording to a WAV file) the recording holds the expected tones at the expected lengths.
+**Test:** `sndtest` (in `/boot/bin`) checks the mixer, every format, 1.5 s of 440 Hz at 48 kHz with `SYNC` timing, the delay and pointer ioctls, non-blocking writes and `poll`, `RESET`, 8 kHz mono through the rate converter, and 44.1 kHz 32-bit audio written in odd-sized pieces; then two clients at once (S16 stereo 48 kHz and U8 mono 22.05 kHz), whose two 1-second sounds take one second together; then, when the codec has an input, capture: 1 s at 48 kHz in real time, `GETISPACE`, `GETIPTR`, `RESET`, a non-blocking read and `poll`, 8 kHz U8 mono through the converter, a second reader at 16 kHz alongside, and full duplex on one descriptor. `sndtest -t FREQ` also checks that what was captured is a tone of FREQ Hz. `sndtest file.wav` plays a WAV file.
 
-**Not yet:** capture, several streams at once (mixing), HDMI/DisplayPort audio, jack detection (plugging headphones in does not switch outputs), and the per-board fixups Linux keeps for particular Realtek laptops.
+In QEMU (`ich9-intel-hda` with `hda-duplex`): with `-audiodev none` every check passes, timings included; with QEMU's ALSA backend reading a 1 kHz tone from a raw file (the `file` plugin's `infile`) and writing the output to another, `sndtest -t 1000` measures 999 Hz at 48 kHz and 1000 Hz after conversion to 8 kHz (that backend runs faster than real time, so its timing checks do not apply), and the output file holds 440 Hz and 660 Hz together at the sum of their levels while the two clients play. With `hda-output` alone `/dev/dsp` refuses `O_RDONLY` with `ENODEV` as before.
+
+**Not yet:** HDMI/DisplayPort audio, several inputs at once (the first one found is used), jack detection (plugging headphones in does not switch outputs), and the per-board fixups Linux keeps for particular Realtek laptops.
 
 ## glibc programs, GTK and Firefox
 
@@ -1262,7 +1283,7 @@ Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the de
 | Need | Kestrel provides |
 |---|---|
 | Drawing | the X server with MIT-SHM (memfd over `SCM_RIGHTS`), RENDER, Composite; fonts through fontconfig and FreeType on the client side |
-| OpenGL | Mesa's llvmpipe through EGL (`eglinfo`: OpenGL 4.5, OpenGL ES 3.2); Xkestrel has no GLX, so `glxinfo` and GLX-only programs need Xorg (on a DRM device), which has GLX, on the GPU where Mesa has a driver for it (virgl in QEMU) |
+| OpenGL | Mesa's llvmpipe through GLX or EGL (`glxinfo`, `eglinfo`: OpenGL 4.5, OpenGL ES 3.2) on Xkestrel; on Xorg (on a DRM device) GLX on the GPU where Mesa has a driver for it (virgl in QEMU) |
 | Shared memory between Firefox's processes | memfd with seals, read-only copies made by reopening `/proc/self/fd/N` |
 | Starting child processes | `clone3` with `CLONE_CLEAR_SIGHAND` (glibc's `posix_spawn`), `waitid` |
 | Profile databases (SQLite) | `fcntl` record locks |
@@ -1277,7 +1298,7 @@ Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the de
 **Limits:**
 - Firefox's sandboxes are on. `/usr/local/bin/firefox` sets `MOZ_ASSUME_USER_NS=1`, because Firefox's probe for user namespaces also tries a PID namespace, which Kestrel doesn't have (Firefox doesn't use one). `KESTREL_FIREFOX_SANDBOX=0` turns the sandboxes off, as in 0.3.8.
 - Slow under emulation: in QEMU without KVM (4 CPUs), Firefox's window appears about 30 s after it is started and a small local page has loaded after about 40 s. It waits about 0.05 s in all for the big kernel lock during that time, down from 5.4 s in 0.3.3 and 76 s before the scheduler, sockets, epoll and memory-map calls were taken off it.
-- No GLX on Xkestrel, no D-Bus session bus, no recording.
+- No D-Bus session bus.
 
 ## Sandboxes: seccomp-bpf, namespaces, capabilities
 
@@ -1581,7 +1602,7 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 | 0.3.7 | AppImages and more programs: FUSE, `mount(2)`, the system calls newer glibc needs, non-PIE executables |
 | 0.3.8 | Vulkan: Mesa's Vulkan drivers (lavapipe in software, NVK on nouveau, Venus on virtio-gpu) and what the kernel needs for them |
 | 0.3.9 | Sandboxes back on: seccomp-bpf and namespaces, so Firefox runs with its sandboxes; an installer that puts Kestrel on a hard drive or SSD; an updater that moves an installed system to the next release (0.3.9 to 0.3.10); SysVinit as the init system |
-| 0.3.10 | Smaller gaps: IPv6, MSI for network cards, ext4 extents, job control, sound capture and mixing |
+| 0.3.10 | Smaller gaps: IPv6 sockets, MSI for network cards, ext4 extents (read-only), shared writable `mmap`, job control, sound capture and mixing, GLX on Xkestrel, USB tethering (RNDIS, CDC ECM and NCM) |
 | 0.3.11 | LXDE fully featured |
 | 0.3.12 | Firefox updated to the latest stable version |
 | 0.3.13 | Kept free for an emergency release, only if needed |

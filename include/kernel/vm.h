@@ -11,6 +11,12 @@
  *   shared              pages of a vm_object (MAP_SHARED of anonymous memory,
  *                       of a ramfs file or memfd): every mapping sees the
  *                       same frames
+ *   shared file         the page cache's frames of a disk file (MAP_SHARED
+ *                       of an ext2 file), writable in place: a write
+ *                       through the mapping sets the page's dirty bit in
+ *                       the page table, which vm_sync_files() and unmapping
+ *                       hand to the page cache (pcache_set_dirty), and the
+ *                       file system writes the page back
  *   device              memory a driver hands out page by page as it is
  *                       touched (a GPU's buffers, MAP_SHARED of /dev/dri):
  *                       the driver's fault callback inserts the frames with
@@ -80,6 +86,7 @@
 #define VMA_VVAR        0x8             /* the vDSO's pages (vdso.h): never writable */
 #define VMA_VDSO        0x10
 #define VMA_DEVICE      0x20            /* with VMA_SHARED: dops/dctx (above) */
+#define VMA_FILE        0x40            /* with VMA_SHARED: the page cache of `file` */
 
 struct file;
 struct vm_object;
@@ -137,6 +144,7 @@ struct mm {
     bool         oom_victim;    /* the OOM killer is waiting for it to go   */
     bool         thp_disable;   /* prctl(PR_SET_THP_DISABLE): only remembered,
                                    there are no huge pages to turn off      */
+    struct mm   *all_prev, *all_next;   /* every address space (vm_sync_files) */
 };
 
 /* With interrupts on; may sleep. Needs no lock held (it takes the big
@@ -160,6 +168,15 @@ struct mm *mm_fork(struct mm *src);         /* copy-on-write copy; NULL on OOM  
  * Returns the address or -errno. `file_end` limits private file data. */
 int64_t vm_mmap(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags,
                 struct file *file, struct vm_object *obj, uint64_t off, uint64_t file_end);
+/* MAP_SHARED of a disk file with a page cache (vnode_ops.getpage and
+ * page_dirty): the region maps the cached frames themselves, writable if
+ * prot says so. */
+int64_t vm_mmap_file(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags, struct file *f, uint64_t off);
+/* Hand the dirty bits of every shared file mapping, in every address
+ * space, to the files' page caches (vnode_ops.page_dirty) and clear them:
+ * pages written through mappings since the last call are then dirty in
+ * the cache, for the file system to write back. No locks held. */
+void    vm_sync_files(void);
 /* mmap() of a device file whose vnode has an mmap callback (MAP_SHARED). */
 int64_t vm_mmap_dev(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags, struct file *f, uint64_t off);
 /* From a device mapping's fault(): map `phys` at `va`, which must lie in a
