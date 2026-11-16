@@ -66,7 +66,7 @@ if [ ! -f "$SRC/xdeps/.done" ]; then
     (cd "$SRC/xdeps" && apt-get source -q --download-only xtrans libxau libxdmcp xcb-proto libxcb \
         libx11 libxkbfile libfontenc libxfont pixman zlib libxext libxrender libxfixes libxdamage \
         libxcomposite libxinerama libxrandr libxpm libpng1.6 libice libsm libxt libxmu libxaw \
-        ncurses x11-xserver-utils libxshmfence)
+        ncurses x11-xserver-utils libxshmfence libglvnd)
     curl -fsSL -o "$SRC/xdeps/xorgproto_2024.1.orig.tar.xz" \
         "https://xorg.freedesktop.org/releases/individual/proto/$XORGPROTO.tar.xz"
     touch "$SRC/xdeps/.done"
@@ -74,6 +74,9 @@ fi
 # added after the list above (DRI3 in Xkestrel): fetched into older trees too
 ls "$SRC"/xdeps/libxshmfence_*.orig.tar.* >/dev/null 2>&1 ||
     (cd "$SRC/xdeps" && apt-get source -q --download-only libxshmfence)
+# and libglvnd's OpenGL headers (GLX in Xkestrel)
+ls "$SRC"/xdeps/libglvnd_*.orig.tar.* >/dev/null 2>&1 ||
+    (cd "$SRC/xdeps" && apt-get source -q --download-only libglvnd)
 
 orig() {    # PACKAGE DIR: noble's upstream tarball of PACKAGE, unpacked as DIR
     [ -d "$SRC/$2" ] && return 0

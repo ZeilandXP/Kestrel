@@ -862,13 +862,12 @@ Kestrel runs x86_64 ELF programs in ring 3, statically or dynamically linked (`p
 - **Handlers run on Linux's frame:** a handler gets the standard `rt_sigframe` (siginfo, a ucontext with the saved registers, and the FPU state: the XSAVE area with Linux's `FP_XSTATE_MAGIC1`/`MAGIC2` markers and `UC_FP_XSTATE`, or `fxsave`'s without XSAVE). A handler starts with clean FPU registers, and `rt_sigreturn` restores what the frame holds, changes included, after clearing anything XRSTOR would fault on; `AT_MINSIGSTKSZ` follows the frame's size and returns through musl's `SA_RESTORER` trampoline into `rt_sigreturn`.
 - **When delivery happens:** on every return to ring 3 (after a system call or an interrupt), so a process spinning in user mode can also be killed.
 - **Blocking calls:** pipe and socket I/O, `accept`, tty reads, `/dev/kinput`, `wait4`, `poll`, `select`, `nanosleep` and `sigsuspend` stop waiting when a signal arrives. They return EINTR to a handler, or restart under `SA_RESTART`, as on Linux.
-- **Default actions:** terminate, or ignore for SIGCHLD, SIGCONT, SIGURG and SIGWINCH. There is no job control: stop signals are ignored.
+- **Default actions:** terminate; ignore for SIGCHLD, SIGURG and SIGWINCH; stop for SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU; continue for SIGCONT.
+- **Job control:** a stop stops every thread of the process until SIGCONT or SIGKILL. The parent gets SIGCHLD with `CLD_STOPPED` or `CLD_CONTINUED` (unless `SA_NOCLDSTOP`), and `wait4`'s `WUNTRACED`/`WCONTINUED` and `waitid`'s `WSTOPPED`/`WCONTINUED` report each change once. A call that only a stop interrupted carries on once continued: `nanosleep` sleeps its full time, other blocking calls restart, and futex waits wake as if spuriously. Orphaned process groups ignore the terminal's stop signals, and a group orphaned with a stopped member gets SIGHUP and SIGCONT. On a terminal, a background group that reads gets SIGTTIN; one that writes with `TOSTOP`, or changes the settings or the foreground group, gets SIGTTOU. `/proc/PID/stat` and `status` show stopped processes as `T`, and `stat` has the terminal's foreground group (`tpgid`).
 - **Threads:** the mask and a pending set are per thread; `kill`, the terminal, SIGCHLD and SIGALRM go to the process and are taken by a thread that does not block them; `tgkill` and CPU faults go to one thread.
 - **CPU faults** call the handler if there is one (see "User programs"); a blocked or ignored fault signal still kills.
 
-`user/proctest.c` (`/boot/bin/proctest`) checks all of this in 31 tests: fork isolation, pipes across fork, 16 concurrent children, execve (also of a missing file), posix_spawn, vfork, setsid, handlers, blocked and ignored signals, FPU state across a handler, SIGCHLD, SIGTERM/SIGKILL (also against a child spinning in user mode), EINTR versus `SA_RESTART`, sigsuspend, interrupted nanosleep, SIGPIPE, `alarm` and periodic `setitimer`, `readlink("/proc/self/exe")`, and abort.
-
-Not done yet: job control (stop/continue).
+`user/proctest.c` (`/boot/bin/proctest`) checks all of this in 31 tests: fork isolation, pipes across fork, 16 concurrent children, execve (also of a missing file), posix_spawn, vfork, setsid, handlers, blocked and ignored signals, FPU state across a handler, SIGCHLD, SIGTERM/SIGKILL (also against a child spinning in user mode), EINTR versus `SA_RESTART`, sigsuspend, interrupted nanosleep, SIGPIPE, `alarm` and periodic `setitimer`, `readlink("/proc/self/exe")`, and abort; then 17 job control checks (stop and continue, the `wait` flags, SIGCHLD codes, `SA_NOCLDSTOP`, orphaned groups, SIGTTIN and SIGTTOU, a sleep across a stop).
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
@@ -884,7 +883,7 @@ make usbimg       # stages bin/Xkestrel, bin/xdemo, bin/dri3test, bin/xrandr and
 ```
 
 `ports/xlibre/build.sh` does four things:
-1. Builds the client and server libraries as static musl libraries into `build/xsysroot`: zlib, xorgproto, xtrans, libXau, libXdmcp, xcb-proto, libxcb, libX11, libxkbfile, libfontenc, libXfont2, pixman, the libraries IceWM and xterm use (libXext, libXrender, libXrandr, libXinerama and more), libxshmfence (DRI3's fences) and a small `libsha1`. Ubuntu's `apt-get source --download-only` tarballs work.
+1. Builds the client and server libraries as static musl libraries into `build/xsysroot`: zlib, xorgproto, xtrans, libXau, libXdmcp, xcb-proto, libxcb, libX11, libxkbfile, libfontenc, libXfont2, pixman, the libraries IceWM and xterm use (libXext, libXrender, libXrandr, libXinerama and more), libxshmfence (DRI3's fences), the OpenGL headers (from libglvnd) with a libGL of empty functions for the server's GLX to link against, and a small `libsha1`. Ubuntu's `apt-get source --download-only` tarballs work.
 2. Applies `ports/xlibre/patches` and adds the `kestrel` meson option and `hw/kestrel`.
 3. Cross-builds the server with musl (`kestrel-cross.txt.in`).
 4. Builds the test clients `xdemo` and `dri3test`, `xrandr` (from Ubuntu's x11-xserver-utils), and precompiles the default keymap with the host's `xkbcomp`.
@@ -904,11 +903,13 @@ Host packages: `musl-tools meson ninja-build pkg-config x11-xkb-utils xkb-data`.
 | Fonts | the built-in `fixed` and `cursor` fonts |
 | MIT-SHM | on: System V segments (`ShmAttach`), or a memfd passed with `SCM_RIGHTS` (`ShmAttachFd`) |
 | DRI3 and Present | on when there is a render node (`hw-kestrel/kdri3.c`): linear GPU buffers in system memory, handed over as dma-bufs, become pixmaps over the buffer itself |
-| GLX, DRI1/DRI2, XDMCP, udev, input thread | disabled |
+| GLX | direct rendering only (`hw-kestrel/kglx.c`): the client's Mesa draws |
+| Indirect GLX, DRI1/DRI2, XDMCP, udev, input thread | disabled |
 
 **The DDX** (`hw-kestrel/kestrel.c`) has two halves:
 - **Screens:** one X screen for all monitors (`-screens N` uses only the first N), a 24-bit TrueColor fb screen with RENDER and RandR. Each monitor is a RandR output with its own CRTC, named after its connector (`DP-1`, `HDMI-A-1`) or else `fbN`. The monitors start side by side, left to right in `/dev/fbN` order with their tops aligned, the first one primary, so they form one desktop. `xrandr` (in `/boot/bin`) can then move (`--pos`, `--left-of`, `--right-of`), mirror (`--same-as`), rotate and reflect (`--rotate`, `--reflect`), switch off (`--off`, `--auto`) and choose the primary (`--primary`); the screen grows and shrinks to fit. A monitor whose kernel driver can switch modes lists them all, and `--mode`/`--rate` switch it (`KFB_GET_MODES`, `KFB_SET_MODE`); the others list only their current mode. The server answers Xinerama queries from RandR, so Xinerama-only clients see the same monitors. A damage listener on the root pixmap collects changes, and a wrapped screen BlockHandler pushes each changed box to every monitor showing it before the server sleeps, after the software cursor has been drawn back; rotated and reflected monitors get the box turned in a scratch buffer first. `ports/xlibre/patches/0003` also fixes the order in which XLibre's own Xinerama (`+xinerama`, for several X screens) lists them.
 - **Input:** a read notification on `/dev/kinput` feeds keys, buttons, relative motion and the wheel (as buttons 4 and 5) into the dix event queue.
+- **GLX** (`hw-kestrel/kglx.c`), for programs that draw with OpenGL through GLX: `glxgears`, `glxinfo`, SDL's OpenGL windows and many games and toolkits. Even a program that renders by itself needs the server's GLX, because libGL asks it for the version, the extensions and the fbconfigs, and has it make the context and drawable ids. Rendering stays in the client: Mesa (llvmpipe, since `/bin/startx` sets `LIBGL_ALWAYS_SOFTWARE=1`) draws into its own memory and shows each frame with MIT-SHM or `PutImage`. The server itself has no OpenGL, so the provider only makes indirect contexts fail, which XLibre refuses by default anyway; it offers the fbconfigs Mesa's drivers have (8-bit RGB with and without alpha, single and double buffered, no depth or 16- or 24-bit depth with or without an 8-bit stencil, sRGB-capable or not, and copies for Composite's 32-bit visual), names the vendor `mesa` for libglvnd, and lists the GLX extensions Mesa offers for direct contexts (`GLX_ARB_create_context` and its profiles, `GLX_EXT_texture_from_pixmap`, `GLX_MESA_copy_sub_buffer` and others). The GL code that indirect GLX carries is linked against the sysroot's libGL of empty functions and never runs.
 - **DRI3** (`hw-kestrel/kdri3.c`), so that Vulkan on a GPU can show its frames: Mesa's Vulkan drivers for a GPU (NVK, for one) present on X11 only through DRI3 and Present, and closed the X connection on a server without them. The screen has DRI3 when the machine has a render node (`/dev/dri/renderD128` on). `DRI3Open` answers with `/dev/null` rather than the GPU, because the screen lives in the CPU's memory: told the GPU, Mesa presents images in video memory, which the CPU reads across PCIe uncached (on the Quadro P2000 a full-screen game and the desktop with it fell to 2 frames per second); told another device, Mesa has the GPU copy each frame into a linear buffer in system memory, which the server reads at memory speed. `DRI3GetSupportedModifiers` offers only `DRM_FORMAT_MOD_LINEAR` for 24- and 32-bit pixmaps, so the buffers the client hands over are plain linear images. `DRI3PixmapFromBuffers` maps the dma-buf into the server and makes a pixmap whose pixels are the buffer itself; fb reads it like any other pixmap. Before each copy or composite from such a pixmap (the screen's `SourceValidate`), `DMA_BUF_IOCTL_SYNC` waits for the fences on the buffer, which is where Mesa puts its rendering's fence when it presents. Present's idle fences are shared-memory futexes (`miSyncShm`, libxshmfence, the same layout as Mesa's). Present has no vblank of its own here: it copies at a fake 60 Hz. `/bin/startx` sets `LIBGL_DRI3_DISABLE=1` and `LIBGL_ALWAYS_SOFTWARE=1` for the Xkestrel session, so OpenGL keeps rendering with llvmpipe as before rather than on a GPU driver that would hand over buffers the CPU cannot read (virgl's live on the host). The second also keeps Firefox on software WebRender: Firefox finds the GPU through DRI3 by itself, and on the Quadro P2000 it chose nouveau and showed only a black window. `dri3test` checks it with a dumb buffer exported as a dma-buf: the version, that `DRI3Open` gives no GPU, the modifiers, a pixmap from the buffer copied to a window and read back, and 120 `PresentPixmap`s with an idle fence, each completing, going idle and triggering the fence.
 
 Exiting the server returns its monitors to their text terminals.
@@ -916,11 +917,12 @@ Exiting the server returns its monitors to their text terminals.
 **Trying it:**
 - Interactively: `run Xkestrel :0` in a terminal.
 - Unattended, with the test client: boot with `kestrel.exec=/boot/bin/Xkestrel,:0+/boot/bin/xdemo`. xdemo opens a window, draws rectangles, a line and text, redraws every second, and logs its key and button events to the kernel log.
+- OpenGL: with an Ubuntu root (the Firefox image's), `LIBGL_ALWAYS_SOFTWARE=1 glxinfo -B` on Xkestrel says "direct rendering: Yes" with llvmpipe (OpenGL 4.5, OpenGL ES 3.2), and `glxgears` draws at about 55 frames per second in QEMU without KVM (2 CPUs).
 - In QEMU: this has been checked with an xHCI keyboard and mouse. The window appears, the pointer moves, and clicks and keys (including Shift) reach the client with the expected evdev keycodes.
 
 As the X protocol requires, the pointer stays hidden until some client defines a cursor; normally that is the window manager's job, and xdemo does it for its test.
 
-**Not yet:** GLX in the server (OpenGL programs use EGL with Mesa's llvmpipe instead), tiled or multi-plane DRI3 buffers, page flips, keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
+**Not yet:** indirect GLX (OpenGL drawn by the server), OpenGL on the GPU under Xkestrel (Xorg has it), tiled or multi-plane DRI3 buffers, page flips, keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
 
 ## IceWM (`ports/icewm/`)
 
@@ -965,7 +967,7 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 - **Devices:** opening `/dev/ptmx` gives a new master; its slave is `/dev/pts/N` (16 pairs). The text terminals use one pair each, from the top (`/dev/pts/15` down): their slave is `/dev/ttyN` (see "The shell on the terminals").
 - **Line discipline:** canonical editing (erase, word erase, kill, EOF), echo with `^X` for control characters, `ICRNL`/`INLCR`/`IGNCR`, output `OPOST`/`ONLCR`, and raw mode with `VMIN`/`VTIME`.
 - **Controlling terminal:** set with `TIOCSCTTY`, or when a session leader opens a slave. `/dev/tty` then opens it; `TIOCGPGRP`/`TIOCSPGRP` set the foreground process group.
-- **Signals:** Ctrl+C, Ctrl+\ and Ctrl+Z send SIGINT, SIGQUIT and SIGTSTP to the foreground group (SIGTSTP is ignored: no job control). `TIOCSWINSZ` sends SIGWINCH. Closing the master sends SIGHUP to the session.
+- **Signals:** Ctrl+C, Ctrl+\ and Ctrl+Z send SIGINT, SIGQUIT and SIGTSTP to the foreground group, so a shell's job control works (Ctrl+Z, `jobs`, `fg`, `bg`). `TIOCSWINSZ` sends SIGWINCH. Closing the master sends SIGHUP to the session.
 - **Hang-up:** after the slave side closes, master reads fail with EIO (as on Linux).
 - **Packet mode:** `TIOCPKT` on the master puts a status byte in front of every read, as on Linux: 0 (`TIOCPKT_DATA`) before the slave's output, or alone, `TIOCPKT_FLUSHREAD`/`TIOCPKT_FLUSHWRITE` after the slave side flushes its queues (`tcflush`, `TCSETSF`, Ctrl+C), which poll reports as `POLLPRI`. VTE turns it on before it starts the shell, and gives up without it, so LXTerminal needs it.
 - **Test:** `user/ptytest.c` checks all of this in 22 tests.
@@ -995,7 +997,7 @@ make usbimg
 
 **Checked in QEMU** with an xHCI keyboard and mouse: commands typed into the shell run, including pipes, `ps`, `top` and `stty size`; Ctrl+C interrupts a running `sleep`; `exit` closes the window, and IceWM reaps xterm.
 
-**Not yet:** fonts other than `fixed`, job control (Ctrl+Z, `fg`/`bg`), and a writable disk to keep files across reboots; `/tmp` and the root file system are in RAM.
+**Not yet:** fonts other than `fixed`, and a writable disk to keep files across reboots; `/tmp` and the root file system are in RAM.
 
 ## SysVinit (`ports/sysvinit/`)
 
@@ -1281,7 +1283,7 @@ Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the de
 | Need | Kestrel provides |
 |---|---|
 | Drawing | the X server with MIT-SHM (memfd over `SCM_RIGHTS`), RENDER, Composite; fonts through fontconfig and FreeType on the client side |
-| OpenGL | Mesa's llvmpipe through EGL (`eglinfo`: OpenGL 4.5, OpenGL ES 3.2); Xkestrel has no GLX, so `glxinfo` and GLX-only programs need Xorg (on a DRM device), which has GLX, on the GPU where Mesa has a driver for it (virgl in QEMU) |
+| OpenGL | Mesa's llvmpipe through GLX or EGL (`glxinfo`, `eglinfo`: OpenGL 4.5, OpenGL ES 3.2) on Xkestrel; on Xorg (on a DRM device) GLX on the GPU where Mesa has a driver for it (virgl in QEMU) |
 | Shared memory between Firefox's processes | memfd with seals, read-only copies made by reopening `/proc/self/fd/N` |
 | Starting child processes | `clone3` with `CLONE_CLEAR_SIGHAND` (glibc's `posix_spawn`), `waitid` |
 | Profile databases (SQLite) | `fcntl` record locks |
@@ -1296,7 +1298,7 @@ Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the de
 **Limits:**
 - Firefox's sandboxes are on. `/usr/local/bin/firefox` sets `MOZ_ASSUME_USER_NS=1`, because Firefox's probe for user namespaces also tries a PID namespace, which Kestrel doesn't have (Firefox doesn't use one). `KESTREL_FIREFOX_SANDBOX=0` turns the sandboxes off, as in 0.3.8.
 - Slow under emulation: in QEMU without KVM (4 CPUs), Firefox's window appears about 30 s after it is started and a small local page has loaded after about 40 s. It waits about 0.05 s in all for the big kernel lock during that time, down from 5.4 s in 0.3.3 and 76 s before the scheduler, sockets, epoll and memory-map calls were taken off it.
-- No GLX on Xkestrel, no D-Bus session bus, no recording.
+- No D-Bus session bus.
 
 ## Sandboxes: seccomp-bpf, namespaces, capabilities
 
