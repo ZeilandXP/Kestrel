@@ -5,14 +5,19 @@
  * common, notify and device configuration structures found through the
  * vendor capabilities, two split virtqueues (0 receive, 1 transmit) of up
  * to 128 entries, one 2 KiB buffer per descriptor, and the 12-byte
- * virtio_net_hdr with no offloads negotiated. Interrupts stay off on both
- * queues: the network thread polls the used rings when the system tick
- * sees them move (net.h). */
+ * virtio_net_hdr with no offloads negotiated. The receive queue and
+ * configuration changes (the link) interrupt through the device's first
+ * MSI-X vector: the handler turns the queue's interrupts off and wakes the
+ * network thread, whose poll turns them back on once the queue is empty.
+ * Transmitted buffers are reclaimed when sending. Without MSI-X the
+ * network thread polls the used ring when the system tick sees it move
+ * (net.h). */
 #include <kernel/net.h>
 #include <kernel/mm.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
+#include <kernel/msi.h>
 #include "pci.h"
 
 #define VIRTIO_VENDOR       0x1AF4
@@ -66,6 +71,10 @@ struct vnet {
     uint32_t notify_mult;
     uint64_t features;
     struct vq rx, tx;
+    int msi;                            /* the vector, or -1: polled from the tick */
+    bool msi_refused;                   /* the device kept "no vector" for a queue */
+    uint32_t kicked;                    /* the interrupt came: look at the link too */
+    bool link;
 };
 
 #define C8(v, o)  (*(volatile uint8_t  *)((v)->common + (o)))
@@ -147,9 +156,11 @@ static bool vq_setup(struct vnet *v, struct vq *q, uint16_t index)
         q->desc[i].flags = 0;
         q->desc[i].next = 0;
     }
-    q->avail->flags = AVAIL_NO_INTERRUPT;
+    bool irq = v->msi >= 0 && index == 0;              /* only the receive queue interrupts */
+    q->avail->flags = irq ? 0 : AVAIL_NO_INTERRUPT;
     C16(v, QSIZE) = q->size;
-    C16(v, QMSIX) = 0xffff;             /* no MSI-X vector */
+    C16(v, QMSIX) = irq ? 0 : 0xffff;   /* MSI-X table entry 0, or none */
+    if (irq && C16(v, QMSIX) != 0) { q->avail->flags = AVAIL_NO_INTERRUPT; v->msi_refused = true; }  /* poll instead */
     C64_SET(v, QDESC, (uint64_t)(uintptr_t)q->desc);
     C64_SET(v, QDRIVER, (uint64_t)(uintptr_t)q->avail);
     C64_SET(v, QDEVICE, (uint64_t)(uintptr_t)q->used);
@@ -218,6 +229,33 @@ static void vnet_poll(struct netif *nif)
     }
     if (n) vq_kick(q);
     reclaim_tx(v);
+    if (v->msi >= 0) {
+        if (__atomic_exchange_n(&v->kicked, 0, __ATOMIC_ACQ_REL) && (v->features & F_NET_STATUS)) {
+            bool up = (*(volatile uint16_t *)(v->devcfg + 6) & 1) != 0;
+            if (up != v->link) {
+                kprintf("virtio-net: %s: link %s\n", nif->name, up ? "up" : "down");
+                v->link = up;
+                netif_carrier(nif, up);
+            }
+        }
+        if (q->last_used == q->used->idx) {             /* caught up: interrupts back on */
+            q->avail->flags = 0;
+            barrier();
+            if (q->last_used != q->used->idx) {         /* one slipped in: look again */
+                q->avail->flags = AVAIL_NO_INTERRUPT;
+                net_kick();
+            }
+        }
+    }
+}
+
+/* MSI-X: the receive queue moved or the configuration changed */
+static void vnet_irq(void *arg)
+{
+    struct vnet *v = arg;
+    if (v->rx.avail) v->rx.avail->flags = AVAIL_NO_INTERRUPT;
+    __atomic_store_n(&v->kicked, 1, __ATOMIC_RELEASE);
+    net_kick();
 }
 
 static bool vnet_pending(struct netif *nif)
@@ -258,7 +296,12 @@ static bool vnet_init(struct pci_device *d)
     C32(v, GFSEL) = 1; C32(v, GF) = (uint32_t)(v->features >> 32);
     C8(v, STATUS) = ST_ACK | ST_DRIVER | ST_FEATURES_OK;
     if (!(C8(v, STATUS) & ST_FEATURES_OK)) { C8(v, STATUS) = ST_FAILED; kfree(v); return false; }
-    C16(v, MSIX) = 0xffff;
+    /* MSI-X before the vectors are written: the device keeps "no vector"
+     * otherwise. Entry 0 serves the receive queue and configuration changes. */
+    v->msi = msi_enable(d, vnet_irq, v, "virtio-net");
+    if (v->msi >= 0 && !msi_is_msix(v->msi)) { msi_disable(d, v->msi); v->msi = -1; }   /* virtio interrupts by MSI-X */
+    C16(v, MSIX) = v->msi >= 0 ? 0 : 0xffff;
+    if (v->msi >= 0 && C16(v, MSIX) != 0) v->msi_refused = true;
     if (!vq_setup(v, &v->rx, 0) || !vq_setup(v, &v->tx, 1)) {
         kprintf("virtio-net: queue setup failed\n");
         C8(v, STATUS) = ST_FAILED;
@@ -284,7 +327,21 @@ static bool vnet_init(struct pci_device *d)
     n->pending = vnet_pending;
     n->link_up = vnet_link;
     n->priv = v;
+    v->link = vnet_link(n);
+    if (v->msi >= 0 && v->msi_refused) {                /* the device refused the vector: poll */
+        C16(v, MSIX) = 0xffff;
+        C16(v, QSEL) = 0;
+        C16(v, QMSIX) = 0xffff;
+        v->rx.avail->flags = AVAIL_NO_INTERRUPT;
+        msi_disable(d, v->msi);
+        v->msi = -1;
+    }
+    if (v->msi >= 0) {
+        msi_set_lockless(v->msi);
+        n->irq = true;
+    }
     netif_register(n);
+    kprintf("virtio-net: %s at %02x:%02x.%u, %s\n", n->name, d->bus, d->device, d->function, v->msi >= 0 ? "MSI-X" : "polled");
     return true;
 }
 

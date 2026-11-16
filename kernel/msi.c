@@ -70,10 +70,10 @@ static bool setup_msi(const struct pci_device *d, uint8_t cap, uint32_t addr, ui
     return true;
 }
 
-int msi_enable(struct pci_device *dev, msi_handler_t fn, void *arg, const char *name)
+static int enable(struct pci_device *dev, msi_handler_t fn, void *arg, const char *name, bool allow_msix)
 {
     if (!apic_enabled() || !fn) return -1;
-    uint8_t msix = find_cap(dev, CAP_MSIX), msi = find_cap(dev, CAP_MSI);
+    uint8_t msix = allow_msix ? find_cap(dev, CAP_MSIX) : 0, msi = find_cap(dev, CAP_MSI);
     if (!msix && !msi) return -1;
     int i;
     uint64_t f = spin_lock_irqsave(&slot_lock);
@@ -92,6 +92,16 @@ int msi_enable(struct pci_device *dev, msi_handler_t fn, void *arg, const char *
     pci_write16(dev->bus, dev->device, dev->function, PCI_REG_COMMAND, (uint16_t)(cmd | PCI_CMD_INTX_DISABLE));
     kprintf("msi: %s at %02x:%02x.%x: vector 0x%x by %s\n", name, dev->bus, dev->device, dev->function, vector, x ? "MSI-X" : "MSI");
     return vector;
+}
+
+int msi_enable(struct pci_device *dev, msi_handler_t fn, void *arg, const char *name)
+{
+    return enable(dev, fn, arg, name, true);
+}
+
+int msi_enable_msi(struct pci_device *dev, msi_handler_t fn, void *arg, const char *name)
+{
+    return enable(dev, fn, arg, name, false);
 }
 
 void msi_disable(struct pci_device *dev, int vector)

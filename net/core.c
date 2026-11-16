@@ -421,13 +421,14 @@ void net_kick(void)
     if (netd) wakeup(&netd_chan);
 }
 
-/* The boot CPU's 1 kHz tick: a received frame or a due timer wakes netd. */
+/* The boot CPU's 1 kHz tick: a due timer, or a frame on a card without
+ * interrupts (polled: one descriptor read per card), wakes netd. */
 void net_tick(void)
 {
     if (!netd) return;
     bool due = netd_wake || (next_timer && time_ms() >= next_timer);
     for (struct netif *n = ifaces; n && !due; n = n->next)
-        if (n->pending && n->pending(n)) due = true;
+        if (!n->irq && n->pending && n->pending(n)) due = true;    /* cards with interrupts wake netd themselves */
     if (due) wakeup(&netd_chan);
 }
 
