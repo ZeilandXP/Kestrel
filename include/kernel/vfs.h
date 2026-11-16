@@ -342,6 +342,7 @@ void devfs_add_monitor(int index);      /* /dev/ttyN, /dev/fbN of a late monitor
 /* fs/pty.c: /dev/ptmx and /dev/pts/N (created by devfs_init) */
 void          pty_init(struct vnode *devroot);
 int           pty_open_ctty(int flags, struct file **out);    /* /dev/tty of a pty session */
+int           pty_fg_pgrp(int ctty);    /* a task's ctty (pty index + 1): its foreground group, or -1 */
 /* Console ptys (kernel/vt.c): the kernel holds the master; `tty_node`
  * (/dev/ttyN) becomes the slave. Returns the pty index or -errno. */
 int           pty_console_create(struct vnode *tty_node, int rows, int cols);

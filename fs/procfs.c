@@ -409,8 +409,9 @@ static size_t gen_pid_stat(char *buf, size_t cap, void *ctx)
     /* pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
      * majflt cmajflt utime stime cutime cstime priority nice threads
      * itrealvalue starttime vsize rss ... (52 fields) */
-    P("%d (%s) %c %d %d %d %d -1 %u 0 0 0 0 %lu 0 0 0 20 0 %d 0 %lu %lu %lu",
-      t->pid, t->name, c->stopped ? 'T' : state_char(t), t->ppid, t->pgid, t->sid, tty, t->user ? 0u : 0x200000u,
+    P("%d (%s) %c %d %d %d %d %d %u 0 0 0 0 %lu 0 0 0 20 0 %d 0 %lu %lu %lu",
+      t->pid, t->name, c->stopped ? 'T' : state_char(t), t->ppid, t->pgid, t->sid, tty, t->ctty ? pty_fg_pgrp(t->ctty) : -1,
+      t->user ? 0u : 0x200000u,
       ticks, c->threads, start, pages * 4096, pages);
     /* startcode and endcode: 0 only for kernel threads, which is how
      * killall5 and ps tell them apart */

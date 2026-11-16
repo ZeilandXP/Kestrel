@@ -780,6 +780,13 @@ static const struct vnode_ops ptmx_ops = { .open = ptmx_open, .nolock = true }; 
 
 /* /dev/tty for a process whose controlling terminal is a pty. Counted as
  * open before the file exists, as slave_open() does. */
+int pty_fg_pgrp(int ctty)
+{
+    if (ctty < 1 || ctty > PTY_MAX) return -1;
+    int g = __atomic_load_n(&ptys[ctty - 1].fg_pgrp, __ATOMIC_RELAXED);
+    return g ? g : -1;
+}
+
 int pty_open_ctty(int flags, struct file **out)
 {
     int ctty = current_task()->ctty;

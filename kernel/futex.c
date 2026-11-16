@@ -140,6 +140,7 @@ static int futex_wait(uint64_t uaddr, uint32_t val, uint64_t deadline_ms, uint32
     }
     if (r) q_remove(b, &q);
     spin_unlock_irqrestore(&b->lock, f);
+    if (r == -EINTR && signal_stop_now()) r = 0;       /* stopped and continued: a spurious wake-up */
     return r;
 }
 

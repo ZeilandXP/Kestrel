@@ -977,7 +977,7 @@ static int64_t sys_nanosleep(uint64_t req, uint64_t rem, uint64_t a3, uint64_t a
     uint64_t ms = (uint64_t)ts.tv_sec > (1ull << 40) ? (1ull << 50) : (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
     uint64_t deadline = time_ms() + ms;
     for (uint64_t now; (now = time_ms()) < deadline; ) {
-        if (signal_pending()) {                         /* EINTR with the time left */
+        if (signal_pending() && !signal_stop_now()) {   /* EINTR with the time left */
             if (rem) {
                 struct timespec r = { (int64_t)((deadline - now) / 1000), (int64_t)((deadline - now) % 1000) * 1000000 };
                 if (copy_to_user((void *)rem, &r, sizeof r)) return -EFAULT;
@@ -1052,7 +1052,7 @@ static int64_t sys_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req, u
                 : (uint64_t)ts.tv_sec * 1000 + ((uint64_t)ts.tv_nsec + 999999) / 1000000;
     uint64_t deadline = time_ms() + ms;
     for (uint64_t now; (now = time_ms()) < deadline; ) {
-        if (signal_pending()) {
+        if (signal_pending() && !signal_stop_now()) {   /* a stop alone: sleep on after it */
             if (rem) {
                 struct timespec r = { (int64_t)((deadline - now) / 1000), (int64_t)((deadline - now) % 1000) * 1000000 };
                 if (copy_to_user((void *)rem, &r, sizeof r)) return -EFAULT;
@@ -2796,7 +2796,9 @@ static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offp, uint
         ssize_t w = vfs_write(out, buf, (size_t)n);
         if (w < 0) { if (!total) total = w; break; }
         total += w;
-        if (w < n) break;
+        /* a short read is the end for now: a terminal's EOF or a pipe's
+         * last bytes must not be read past (a file's short read is its end) */
+        if (w < n || (size_t)n < want) break;
     }
 restore:
     if (offp) {

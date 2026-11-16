@@ -225,6 +225,24 @@ static void job_control_tests(void)
     close(pfd[0]);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0 && c == 'h', "an orphaned stopped group is sent SIGHUP and SIGCONT");
 
+    /* a sleep that is stopped and continued carries on to its full length */
+    pid = fork();
+    if (pid == 0) {
+        struct timespec a, b, req = { 0, 600 * 1000000L };
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        int r = nanosleep(&req, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        long ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+        _exit(r == 0 && ms >= 590 ? 0 : 1);
+    }
+    msleep(100);
+    kill(pid, SIGSTOP);
+    waitpid(pid, &st, WUNTRACED);
+    msleep(100);
+    kill(pid, SIGCONT);
+    st = wait_status(pid);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "nanosleep stopped and continued sleeps on, without EINTR");
+
     /* a terminal: background reads stop with SIGTTIN, TOSTOP writes with SIGTTOU */
     int m = posix_openpt(O_RDWR | O_NOCTTY);
     if (m < 0 || grantpt(m) || unlockpt(m)) { CHECK(0, "a pty for the terminal checks"); return; }

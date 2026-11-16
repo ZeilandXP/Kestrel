@@ -132,6 +132,7 @@ static void vfork_release(struct tcb *t)
 static int send_thread_locked(struct tcb *t, int sig, const struct ksig_info *info);
 static int send_info_locked(struct tcb *t, int sig, const struct ksig_info *info);
 static void orphan_check_locked(struct tcb *t);
+static uint64_t deliverable_of(const struct tcb *t);
 
 /* Send a thread-directed SIGKILL to every other live thread of t's group.
  * proc_lock held. */
@@ -927,6 +928,41 @@ static bool must_stop(const struct tcb *t)
 {
     const struct signal_struct *g = t->signal;
     return g->stopped && !g->group_exit && !(t->sig_pending & sigbit(SIGKILL));
+}
+
+/* For calls that would otherwise give EINTR (nanosleep, futex waits): if
+ * what interrupts the current thread is only a stop (a stop signal with
+ * its default action, or its process already stopping), stop here and
+ * return true once continued, so the call carries on instead, as Linux's
+ * restartable sleeps do. False if a signal is still to be delivered. */
+bool signal_stop_now(void)
+{
+    struct tcb *t = current_task();
+    if (!t->user) return false;
+    bool stopped = false;
+    uint64_t fl = spin_lock_irqsave(&proc_lock);
+    for (;;) {
+        if (must_stop(t)) {
+            stopped = true;
+            t->sig_kick = false;
+            while (must_stop(t)) sleep_on_locked(&t->signal->stopped, &proc_lock);
+            continue;
+        }
+        uint64_t ready = deliverable_of(t), stops = 0;
+        for (uint64_t r = ready; r; r &= r - 1) {
+            int sig = __builtin_ctzll(r) + 1;
+            if (stop_signal(sig) && t->sighand->action[sig - 1].handler == SIG_DFL) stops |= sigbit(sig);
+        }
+        if (!ready || ready != stops) break;            /* nothing, or a signal for a handler */
+        int sig = __builtin_ctzll(stops) + 1;
+        if (t->sig_pending & sigbit(sig)) t->sig_pending &= ~sigbit(sig);
+        else t->signal->shared_pending &= ~sigbit(sig);
+        if (sig == SIGSTOP || !pgrp_orphaned_locked(t->pgid, NULL)) group_stop_locked(t, sig);
+        stopped = true;
+    }
+    bool clean = stopped && !deliverable_of(t);
+    spin_unlock_irqrestore(&proc_lock, fl);
+    return clean;
 }
 
 int proc_tty_background(int fg_pgrp, int sig)

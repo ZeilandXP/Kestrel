@@ -114,6 +114,7 @@ void signal_force_info(int sig, const struct ksig_info *info);     /* the same, 
  * when it is the last thread, its whole process does. */
 __attribute__((noreturn)) void signal_die(int sig, bool group, uint64_t rip);
 bool signal_pending(void);                      /* for blocking loops         */
+bool signal_stop_now(void);                     /* only a stop pending: stop, true once continued */
 /* signalfd: take the lowest pending signal of the current thread that is in
  * mask (its own first, then the process'); 0 if none. */
 int  signal_dequeue(uint64_t mask, struct ksig_info *info);
