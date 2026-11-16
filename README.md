@@ -1211,11 +1211,15 @@ Intel High Definition Audio, the sound hardware of nearly every PC since 2004, w
 
 **Codecs.** Each codec's audio function group is reset and powered up, then every widget is read: capabilities, connection lists (short and long form, ranges), pin capabilities and configuration defaults, amplifier capabilities and supported rates. Outputs are chosen from the pin configuration in this order: speaker, headphones, line out; jacks the firmware marks as unconnected are skipped. From each pin a path to a DAC is found through mixers and selectors; the path is selected, its input amplifiers unmuted and its output amplifiers set to 0 dB. Pins get their output and headphone enables and EAPD (the external amplifier switch Realtek codecs need on laptops). Realtek codecs are named in the log as `Realtek ALCxxx`.
 
-**Playback.** One output stream with a 64 KiB ring in 8 buffer descriptors, polled every 4 ms by the `hdad` thread through the DMA position buffer (or the link position register when the buffer stays still). Played parts of the ring are cleared, so an underrun plays silence, and the stream stops a second after the last writer closes and the ring runs dry.
+**Inputs.** The first input pin the board wires up, in this order: microphone, line in, anything else that takes input. A path from it to an analog ADC is found through mixers and selectors, selected and unmuted at 0 dB, and the pin's input is enabled, with bias voltage (80%, or 50%) for a microphone.
 
-**`/dev/dsp`** (OSS, `14,3`): unsigned 8-bit, signed 16-bit and 32-bit little-endian samples, mono or stereo (mono is doubled), any rate from 4 kHz to 192 kHz. Rates the codec lacks are converted (linear interpolation) and the hardware runs at 48 kHz. Writes block until there is room, or return `EAGAIN` with `O_NONBLOCK`; `poll` works. The usual ioctls: `SNDCTL_DSP_RESET`, `SYNC`, `POST`, `SPEED`, `SETFMT`, `CHANNELS`, `STEREO`, `GETBLKSIZE`, `SETFRAGMENT`, `SUBDIVIDE`, `GETFMTS`, `GETOSPACE`, `GETODELAY`, `GETOPTR`, `GETCAPS`, `GET/SETTRIGGER`, `NONBLOCK`, `OSS_GETVERSION`. One writer at a time (`EBUSY`); there is no capture yet (`ENODEV` for reading).
+**Streams.** One output and one input stream, each a 64 KiB ring in 8 buffer descriptors, polled every 4 ms by the `hdad` thread through the DMA position buffer (or the link position register when the buffer stays still). Played parts of the output ring are cleared, so an underrun plays silence; the output stops a second after the last playback client closes and the ring runs dry, the input when the last capture client closes.
 
-**`/dev/mixer`** (`14,0`): master and PCM volume (0 to 100, mapped onto the output amplifiers' steps up to 0 dB), plus the device masks and `SOUND_MIXER_INFO`. `/proc/sound` shows the controller, codecs, chosen outputs and the stream's state.
+**Mixing.** Every open of `/dev/dsp` is a client with its own format, rate and positions, up to 8 at once. Playback clients add their samples into the output ring at their own write positions, ahead of the hardware, saturating at the 16-bit limits, so several programs play at once without a sound server. The hardware runs at one rate per direction: a client alone in its direction gets the codec running at its own rate when the codec has it (no conversion), and the others are converted to the rate the stream already runs at.
+
+**`/dev/dsp`** (OSS, `14,3`): unsigned 8-bit, signed 16-bit and 32-bit little-endian samples, mono or stereo, any rate from 4 kHz to 192 kHz, for writing and reading. Rates the stream does not run at are converted (linear interpolation). `O_WRONLY` plays, `O_RDONLY` records (`ENODEV` if the codec has no input), `O_RDWR` does both. Writes block until there is room and reads until all of the request has come in, or return `EAGAIN` with `O_NONBLOCK`; `poll` reports `POLLOUT` and `POLLIN`. Each capture client reads the input ring from its own position; one that falls more than about 300 ms behind skips ahead (an overrun). Mono capture is the average of the two channels. The usual ioctls: `SNDCTL_DSP_RESET`, `SYNC`, `POST`, `SPEED`, `SETFMT`, `CHANNELS`, `STEREO`, `GETBLKSIZE`, `SETFRAGMENT`, `SUBDIVIDE`, `GETFMTS`, `GETOSPACE`, `GETISPACE`, `GETODELAY`, `GETOPTR`, `GETIPTR`, `GETCAPS` (with `DSP_CAP_DUPLEX` when there is an input), `GET/SETTRIGGER`, `NONBLOCK`, `OSS_GETVERSION`. `SYNC`, `GETODELAY` and `GETOPTR` are per client; `RESET` drops a client's queued sound from the ring only when it plays alone (mixed, it is already part of the sum).
+
+**`/dev/mixer`** (`14,0`): master and PCM volume (0 to 100, mapped onto the output amplifiers' steps up to 0 dB), the recording source (`SOUND_MASK_MIC` or `SOUND_MASK_LINE`, whichever input was found), the device masks and `SOUND_MIXER_INFO`. `/proc/sound` shows the controller, codecs, chosen outputs and input, and both streams' state and clients.
 
 **ALSA programs** (`aplay`, `speaker-test`) use the ALSA library's OSS plugin from `libasound2-plugins`, with this `/etc/asound.conf`:
 
@@ -1227,7 +1231,7 @@ ctl.!default { type oss device /dev/mixer }
 **PulseAudio programs**, Firefox among them (Mozilla's builds have no ALSA backend), go through PulseAudio 16 with its OSS module on `/dev/dsp`. `tools/mkfirefoxroot.sh` writes this as `/etc/pulse/kestrel.pa`:
 
 ```
-load-module module-oss device=/dev/dsp sink_name=kestrel playback=1 record=0 mmap=0
+load-module module-oss device=/dev/dsp sink_name=kestrel source_name=kestrel-in playback=1 record=1 mmap=0
 load-module module-native-protocol-unix auth-anonymous=1
 load-module module-always-sink
 set-default-sink kestrel
@@ -1235,9 +1239,11 @@ set-default-sink kestrel
 
 `pulseaudio -n -F /etc/pulse/kestrel.pa --exit-idle-time=-1` starts it; `paplay`, `pactl` and Firefox's Web Audio then play, at 44.1 kHz converted to the codec's 48 kHz.
 
-**Test:** `sndtest` (in `/boot/bin`) checks the mixer, exclusive open, every format, 1.5 s of 440 Hz at 48 kHz with `SYNC` timing, the delay and pointer ioctls, non-blocking writes and `poll`, `RESET`, 8 kHz mono through the rate converter, and 44.1 kHz 32-bit audio written in odd-sized pieces. `sndtest file.wav` plays a WAV file. In QEMU (`-device intel-hda -device hda-output` or `ich9-intel-hda` with `hda-duplex`, recording to a WAV file) the recording holds the expected tones at the expected lengths.
+**Test:** `sndtest` (in `/boot/bin`) checks the mixer, every format, 1.5 s of 440 Hz at 48 kHz with `SYNC` timing, the delay and pointer ioctls, non-blocking writes and `poll`, `RESET`, 8 kHz mono through the rate converter, and 44.1 kHz 32-bit audio written in odd-sized pieces; then two clients at once (S16 stereo 48 kHz and U8 mono 22.05 kHz), whose two 1-second sounds take one second together; then, when the codec has an input, capture: 1 s at 48 kHz in real time, `GETISPACE`, `GETIPTR`, `RESET`, a non-blocking read and `poll`, 8 kHz U8 mono through the converter, a second reader at 16 kHz alongside, and full duplex on one descriptor. `sndtest -t FREQ` also checks that what was captured is a tone of FREQ Hz. `sndtest file.wav` plays a WAV file.
 
-**Not yet:** capture, several streams at once (mixing), HDMI/DisplayPort audio, jack detection (plugging headphones in does not switch outputs), and the per-board fixups Linux keeps for particular Realtek laptops.
+In QEMU (`ich9-intel-hda` with `hda-duplex`): with `-audiodev none` every check passes, timings included; with QEMU's ALSA backend reading a 1 kHz tone from a raw file (the `file` plugin's `infile`) and writing the output to another, `sndtest -t 1000` measures 999 Hz at 48 kHz and 1000 Hz after conversion to 8 kHz (that backend runs faster than real time, so its timing checks do not apply), and the output file holds 440 Hz and 660 Hz together at the sum of their levels while the two clients play. With `hda-output` alone `/dev/dsp` refuses `O_RDONLY` with `ENODEV` as before.
+
+**Not yet:** HDMI/DisplayPort audio, several inputs at once (the first one found is used), jack detection (plugging headphones in does not switch outputs), and the per-board fixups Linux keeps for particular Realtek laptops.
 
 ## glibc programs, GTK and Firefox
 
