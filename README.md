@@ -1100,7 +1100,8 @@ What it supports:
 How it handles everything else:
 - Directories with an htree index (`dir_index`) are read linearly. A directory Kestrel changes loses its index flag, as `e2fsck` expects from a kernel without htree support.
 - Unknown read-only-compatible features (metadata checksums, huge files, ...) mount read-only.
-- Extents (ext4), 64-bit block numbers, journals that need recovery and compression are refused.
+- Stock ext4 volumes (as `mkfs.ext4` makes them: extents, 64bit, flex_bg, metadata_csum, huge_file, dir_nlink, extra_isize) mount read-only, so an ext4 root or data disk from a Linux install can be read. Files and directories mapped by an extent tree are looked up through it, at any depth; extents allocated but not written yet read as zeros. 64-byte group descriptors work as long as block numbers fit in 32 bits (16 TiB at 4 KiB blocks). `/proc/mounts` calls such a volume `ext4`.
+- Journals that need recovery (run `e2fsck` first), meta_bg, inline data, encryption and compression are refused.
 
 How it works:
 - **Inodes:** hard links share one in-memory copy of the raw on-disk inode, so fields Kestrel does not interpret survive a write.
@@ -1130,6 +1131,7 @@ How it works:
   - free space returning exactly to where it started.
 - `fstest -r` writes files, restarts the machine, and checks them after the reboot.
 - After each run, `e2fsck -fn` on the image finds no errors. This holds with 4 KiB blocks and 256-byte inodes, and with 1 KiB blocks and 128-byte inodes.
+- ext4: a 600 MB volume from a stock `mkfs.ext4 -d` boots as the root (`kestrel.rootfs=LABEL=...`, read-only). The checksums of a 50 MB file, a 300 MB sparse file and a file of 2000 separate extents (a tree of depth 2) match the host's, a 3000-entry directory (with its htree) lists in full, slow symbolic links read back, and writes fail with `EROFS`.
 
 **Alpine Linux as the root.** Alpine's own minirootfs (3.24.2, from the official `alpinelinux/docker-alpine` repository) runs unmodified on Kestrel. The images can be built on it:
 
@@ -1150,7 +1152,7 @@ Alpine on another disk works too: put it on an ext2 partition, label it, and boo
 
 **Not yet:**
 - Shared writable `mmap` of disk files (read-only shared mappings work).
-- ext4 extents.
+- Writing to ext4 volumes that use extents (they mount read-only).
 - Device nodes, FIFOs and sockets on disk (`/dev` is devfs).
 - `mount(2)` for other volumes.
 

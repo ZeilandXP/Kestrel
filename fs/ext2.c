@@ -14,9 +14,11 @@
  * journal is left alone). Directories indexed by an htree (dir_index) are
  * read linearly; a directory we change loses its index flag, as e2fsck
  * expects of a kernel without htree support. Mounted read-only: features
- * whose metadata we would have to keep up (checksums, huge files, ...).
- * Refused: extents (ext4), 64-bit block numbers, journals that need
- * recovery, compression.
+ * whose metadata we would have to keep up (checksums, huge files, ...),
+ * and stock ext4 volumes: files mapped by extent trees (ext_map), 64-byte
+ * group descriptors (as long as block numbers fit in 32 bits), checksum
+ * seeds and large directories. Refused: journals that need recovery,
+ * meta_bg, inline data, encryption, compression.
  *
  * In memory. Every vnode of an ext2 file points at a shared `struct e2ino`
  * (hard links share one), which holds the raw on-disk inode: fields we do
@@ -53,13 +55,23 @@
 
 #define INCOMPAT_FILETYPE   0x0002
 #define INCOMPAT_RECOVER    0x0004
+#define INCOMPAT_EXTENTS    0x0040
+#define INCOMPAT_64BIT      0x0080
 #define INCOMPAT_FLEX_BG    0x0200
+#define INCOMPAT_CSUM_SEED  0x2000
+#define INCOMPAT_LARGEDIR   0x4000
 #define INCOMPAT_SUPPORTED  (INCOMPAT_FILETYPE | INCOMPAT_FLEX_BG)
+/* ext4 features we can read but not keep up when writing: such a volume is
+ * mounted read-only */
+#define INCOMPAT_READ_ONLY  (INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_CSUM_SEED | INCOMPAT_LARGEDIR)
 #define RO_SPARSE_SUPER     0x0001
 #define RO_LARGE_FILE       0x0002
 #define RO_BTREE_DIR        0x0004
 #define RO_SUPPORTED        (RO_SPARSE_SUPER | RO_LARGE_FILE | RO_BTREE_DIR)
 #define INDEX_FL            0x00001000
+#define EXTENTS_FL          0x00080000
+#define EXT_MAGIC           0xF30A          /* extent tree node header */
+#define EXT_MAX_DEPTH       5
 
 /* superblock offsets */
 #define SB_INODES_COUNT     0
@@ -82,6 +94,8 @@
 #define SB_FEATURE_INCOMPAT 96
 #define SB_FEATURE_RO       100
 #define SB_VOLUME_NAME      120
+#define SB_DESC_SIZE        254             /* 64bit: bytes per group descriptor */
+#define SB_BLOCKS_COUNT_HI  336
 
 /* inode offsets */
 #define I_MODE      0
@@ -154,7 +168,8 @@ struct e2fs {
     uint32_t incompat;
     uint8_t  sb[1024];                      /* the superblock as on disk */
     bool     sb_dirty;
-    uint8_t *gdt;                           /* group descriptors, 32 bytes each */
+    uint8_t *gdt;                           /* group descriptors, desc_size bytes each */
+    uint32_t desc_size;                     /* 32, or 64 and more on 64bit volumes */
     uint32_t gdt_blocks;
     bool     gdt_dirty;
     /* block cache */
@@ -171,10 +186,18 @@ struct e2fs {
 static const struct vnode_ops e2_file_ops, e2_dir_ops, e2_link_ops, e2_special_ops;
 static struct e2fs *volumes[8];
 
-static uint8_t *gd(struct e2fs *fs, uint32_t g) { return fs->gdt + (size_t)g * 32; }
-static uint32_t gd_block_bitmap(struct e2fs *fs, uint32_t g) { return g32(gd(fs, g)); }
-static uint32_t gd_inode_bitmap(struct e2fs *fs, uint32_t g) { return g32(gd(fs, g) + 4); }
-static uint32_t gd_inode_table(struct e2fs *fs, uint32_t g) { return g32(gd(fs, g) + 8); }
+static uint8_t *gd(struct e2fs *fs, uint32_t g) { return fs->gdt + (size_t)g * fs->desc_size; }
+/* A block number of a group descriptor: the low half at `off`, on 64bit
+ * volumes the high half at off + 32 (nonzero: past what we can address,
+ * which blk_ok refuses). */
+static uint32_t gd_blk(struct e2fs *fs, uint32_t g, uint32_t off)
+{
+    if (fs->desc_size >= 64 && g32(gd(fs, g) + off + 32)) return UINT32_MAX;
+    return g32(gd(fs, g) + off);
+}
+static uint32_t gd_block_bitmap(struct e2fs *fs, uint32_t g) { return gd_blk(fs, g, 0); }
+static uint32_t gd_inode_bitmap(struct e2fs *fs, uint32_t g) { return gd_blk(fs, g, 4); }
+static uint32_t gd_inode_table(struct e2fs *fs, uint32_t g) { return gd_blk(fs, g, 8); }
 
 static bool blk_ok(struct e2fs *fs, uint32_t b) { return b >= fs->first_data_block && b < fs->blocks; }
 
@@ -497,10 +520,59 @@ static int ind_slot(struct e2fs *fs, struct e2ino *e, uint32_t blk, uint32_t idx
     return 0;
 }
 
+static bool has_extents(struct e2ino *e) { return g32(e->raw + I_FLAGS) & EXTENTS_FL; }
+
+/* ext4: the disk block of file block `lb` through the inode's extent tree.
+ * A node is a 12-byte header (magic, entries, max, depth) and 12-byte
+ * entries sorted by first file block: an index entry points to the node
+ * below, a leaf (depth 0) maps a run of up to 32768 blocks; a length past
+ * 32768 marks a run allocated but not written yet, which reads as zeros.
+ * The root node is the inode's 60 bytes of block pointers. 0: a hole. */
+static int ext_map(struct e2fs *fs, struct e2ino *e, uint64_t lb, uint32_t *out)
+{
+    *out = 0;
+    if (lb > UINT32_MAX) return 0;
+    const uint8_t *node = e->raw + I_BLOCK;
+    uint32_t room = 60;
+    struct buf *b = NULL;
+    int want = -1;
+    for (;;) {
+        uint32_t entries = g16(node + 2), depth = g16(node + 6);
+        if (g16(node) != EXT_MAGIC || 12 + entries * 12 > room || depth > EXT_MAX_DEPTH ||
+            (want >= 0 && depth != (uint32_t)want)) {
+            kprintf("ext2: %s: corrupt extent tree in inode %u\n", fs->dev->name, e->ino);
+            brelse(b);
+            return -EIO;
+        }
+        const uint8_t *x = NULL;                        /* the last entry starting at or before lb */
+        for (uint32_t i = 0; i < entries && g32(node + 12 + i * 12) <= lb; i++) x = node + 12 + i * 12;
+        if (!x) { brelse(b); return 0; }
+        if (depth == 0) {
+            uint32_t first = g32(x), len = g16(x + 4);
+            uint64_t start = (uint64_t)g16(x + 6) << 32 | g32(x + 8);
+            int r = 0;
+            if (len <= 32768 && lb - first < len) {
+                uint64_t pb = start + (lb - first);
+                if (pb > UINT32_MAX || !blk_ok(fs, (uint32_t)pb)) r = -EIO;
+                else *out = (uint32_t)pb;
+            }
+            brelse(b);
+            return r;
+        }
+        uint64_t child = (uint64_t)g16(x + 8) << 32 | g32(x + 4);
+        brelse(b);
+        if (child > UINT32_MAX || !blk_ok(fs, (uint32_t)child) || !(b = bread(fs, (uint32_t)child))) return -EIO;
+        node = b->data;
+        room = fs->bs;
+        want = (int)depth - 1;
+    }
+}
+
 /* The disk block of file block `lb` (0: a hole), allocating it and any
  * indirect blocks on the way when `create`. */
 static int bmap(struct e2fs *fs, struct e2ino *e, uint64_t lb, bool create, uint32_t *out)
 {
+    if (has_extents(e)) return create ? -EROFS : ext_map(fs, e, lb, out);   /* volumes with extents are read-only */
     uint32_t per = fs->bs / 4;
     uint8_t *ib = e->raw + I_BLOCK;
     uint32_t goal = g32(ib) ? g32(ib) + (uint32_t)lb : gd_inode_table(fs, (e->ino - 1) / fs->ipg);
@@ -572,6 +644,7 @@ static void truncate_blocks(struct e2fs *fs, struct e2ino *e, uint64_t size)
 {
     uint16_t mode = g16(e->raw + I_MODE);
     if ((mode & S_IFMT) == S_IFLNK && i_size(e) < 60 && g32(e->raw + I_BLOCKS) == 0) return;  /* fast link */
+    if (has_extents(e)) return;                         /* read-only volumes only: never here */
     uint64_t keep = (size + fs->bs - 1) / fs->bs;       /* file blocks that stay */
     uint32_t per = fs->bs / 4;
     uint8_t *ib = e->raw + I_BLOCK;
@@ -1465,22 +1538,34 @@ int ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out)
         kprintf("ext2: %s: superblock values out of range\n", dev->name);
         goto fail;
     }
-    if (fs->incompat & 0x40) { kprintf("ext2: %s: ext4 extents are not supported yet\n", dev->name); goto fail; }
     if (fs->incompat & INCOMPAT_RECOVER) { kprintf("ext2: %s: journal needs recovery (run e2fsck)\n", dev->name); goto fail; }
-    if (fs->incompat & ~INCOMPAT_SUPPORTED) {
-        kprintf("ext2: %s: unsupported features %x\n", dev->name, fs->incompat & ~INCOMPAT_SUPPORTED);
+    if (fs->incompat & ~(INCOMPAT_SUPPORTED | INCOMPAT_READ_ONLY)) {
+        kprintf("ext2: %s: unsupported features %x\n", dev->name, fs->incompat & ~(INCOMPAT_SUPPORTED | INCOMPAT_READ_ONLY));
         goto fail;
+    }
+    fs->desc_size = 32;
+    if (fs->incompat & INCOMPAT_64BIT) {
+        fs->desc_size = g16(sb + SB_DESC_SIZE);
+        if (fs->desc_size < 32 || fs->desc_size > 1024 || (fs->desc_size & (fs->desc_size - 1)) || fs->desc_size > fs->bs) {
+            kprintf("ext2: %s: group descriptor size %u out of range\n", dev->name, fs->desc_size);
+            goto fail;
+        }
+        if (g32(sb + SB_BLOCKS_COUNT_HI)) { kprintf("ext2: %s: more than 2^32 blocks\n", dev->name); goto fail; }
     }
     /* Whole disks are left alone (a partition is where a root belongs);
      * RAM disks are the exception: the ISO's root lives on one. */
     fs->rdonly = rdonly || (!dev->parent && dev->kind != BLK_DISK_RAM) || !blk_disk_of(dev)->ops->write;
+    if (!fs->rdonly && (fs->incompat & INCOMPAT_READ_ONLY)) {
+        kprintf("ext2: %s: ext4 features %x are read-only here: mounted read-only\n", dev->name, fs->incompat & INCOMPAT_READ_ONLY);
+        fs->rdonly = true;
+    }
     if (!fs->rdonly && (ro & ~RO_SUPPORTED)) {
         kprintf("ext2: %s: features %x need support we lack: mounted read-only\n", dev->name, ro & ~RO_SUPPORTED);
         fs->rdonly = true;
     }
     fs->ngroups = (fs->blocks - fs->first_data_block + fs->bpg - 1) / fs->bpg;
     if ((uint64_t)fs->ngroups * fs->ipg < fs->inodes) goto fail;
-    fs->gdt_blocks = (fs->ngroups * 32 + fs->bs - 1) / fs->bs;
+    fs->gdt_blocks = (uint32_t)(((uint64_t)fs->ngroups * fs->desc_size + fs->bs - 1) / fs->bs);
     fs->gdt = kmalloc((size_t)fs->gdt_blocks * fs->bs);
     if (!fs->gdt) { r = -ENOMEM; goto fail; }
     if (dev_io(fs, fs->first_data_block + 1, fs->gdt_blocks, fs->gdt, false) < 0) { r = -EIO; goto fail; }
@@ -1501,7 +1586,7 @@ int ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out)
 
     struct mount *m = kzalloc(sizeof *m);
     if (!m) { r = -ENOMEM; goto fail; }
-    strlcpy(m->fstype, "ext2", sizeof m->fstype);
+    strlcpy(m->fstype, fs->incompat & INCOMPAT_EXTENTS ? "ext4" : "ext2", sizeof m->fstype);
     snprintf(m->source, sizeof m->source, "/dev/%s", dev->name);
     m->flags = fs->rdonly ? MNT_RDONLY : 0;
     m->dev = 0x800 + (uint32_t)(dev - blk_get(0));

@@ -154,7 +154,7 @@ int rootfs_mount(void)
     if (vfs_lookup("/tmp", &vn) == 0) vfs_vnode_put(vn);
     else if (!(m->flags & MNT_RDONLY)) vfs_mkdir("/tmp", 01777);
     if (vfs_mount(tmp, "/tmp") < 0) kprintf("rootfs: no /tmp on the root volume: /tmp unavailable\n");
-    kprintf("rootfs: \033[92m/ is now /dev/%s\033[0m (ext2%s)\n", dev->name,
+    kprintf("rootfs: \033[92m/ is now /dev/%s\033[0m (%s%s)\n", dev->name, m->fstype,
             (m->flags & MNT_RDONLY) ? ", read-only" : dev->kind == BLK_DISK_RAM ? ", in memory: changes last until power-off" : "");
     return 0;
 }
