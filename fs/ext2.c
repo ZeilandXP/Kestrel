@@ -45,6 +45,7 @@
 #include <kernel/cpu.h>
 #include <kernel/ext2.h>
 #include <kernel/pagecache.h>
+#include <kernel/vm.h>
 
 #define EXT2_MAGIC          0xEF53
 #define EXT2_ROOT_INO       2
@@ -918,7 +919,8 @@ static void touch(struct vnode *vn, struct e2ino *e, bool content)
     vn->ctime = t;
 }
 
-static ssize_t e2_write_locked(struct e2fs *fs, struct e2ino *e, const void *buf, size_t len, uint64_t off)
+/* `cache`: update the cached pages too (not when writing one of them back). */
+static ssize_t e2_write_locked(struct e2fs *fs, struct e2ino *e, const void *buf, size_t len, uint64_t off, bool cache)
 {
     size_t done = 0;
     int err = 0;
@@ -936,7 +938,7 @@ static ssize_t e2_write_locked(struct e2fs *fs, struct e2ino *e, const void *buf
         done += n;
     }
     if (done && off + done > i_size(e)) set_size(fs, e, off + done);
-    if (done) pcache_write(e->pc, buf, done, off);      /* cached pages stay current */
+    if (done && cache) pcache_write(e->pc, buf, done, off);    /* cached pages stay current */
     if (done || err) inode_write(fs, e);                /* block pointers may have changed */
     return done ? (ssize_t)done : err;
 }
@@ -948,10 +950,52 @@ static ssize_t e2_write(struct vnode *vn, const void *buf, size_t len, uint64_t 
     kmutex_lock(&fs->lock);
     struct e2ino *e = ino_of(vn);
     if (off == VFS_APPEND) off = i_size(e);
-    ssize_t r = e2_write_locked(fs, e, buf, len, off);
+    ssize_t r = e2_write_locked(fs, e, buf, len, off, true);
     if (r > 0) { touch(vn, e, true); inode_write(fs, e); vn->blocks = g32(e->raw + I_BLOCKS); }
     kmutex_unlock(&fs->lock);
     return r;
+}
+
+/* ---- shared writable mappings ------------------------------------------------------
+ * MAP_SHARED of a file maps its cached pages writable (vm.c: vm_mmap_file).
+ * The address spaces' dirty bits reach the page cache through
+ * e2_page_dirty when vm_sync_files() looks (at every sync, so every 5
+ * seconds) or a mapping goes; writeback() then writes the dirty pages
+ * through the block cache like write() would, allocating blocks for holes
+ * and stopping at the end of the file. An inode is written back before its
+ * pages are dropped (release_inode). */
+static void e2_page_dirty(struct vnode *vn, uint64_t idx)
+{
+    pcache_set_dirty(ino_of(vn)->pc, idx);              /* a spinlock: the caller holds an mm's lock */
+}
+
+/* fs->lock held. */
+static int writeback(struct e2fs *fs, struct e2ino *e)
+{
+    int err = 0;
+    bool any = false;
+    uint64_t idx = 0, p;
+    while ((p = pcache_take_dirty(e->pc, &idx))) {
+        uint64_t off = idx * PAGE_SIZE, size = i_size(e);
+        if (off < size) {
+            size_t n = size - off < PAGE_SIZE ? (size_t)(size - off) : PAGE_SIZE;
+            ssize_t r = e2_write_locked(fs, e, (const void *)p, n, off, false);
+            if (r < 0 || (size_t)r < n) {
+                kprintf("ext2: %s: inode %u: writing back a mapped page failed (%ld)\n", fs->dev->name, e->ino, (long)r);
+                err = r < 0 ? (int)r : -EIO;
+            }
+            any = true;
+        }
+        page_unref(p);
+        idx++;
+    }
+    if (any) {                                          /* written through a mapping: modified */
+        uint32_t t = now32();
+        p32(e->raw + I_MTIME, t);
+        p32(e->raw + I_CTIME, t);
+        inode_write(fs, e);
+    }
+    return err;
 }
 
 static uint64_t e2_size(struct vnode *vn)
@@ -1038,6 +1082,7 @@ static void release_inode(struct e2fs *fs, struct e2ino *e)
         inode_write(fs, e);
         free_inode(fs, e->ino, dir);
     }
+    if (!fs->rdonly && pcache_dirty(e->pc)) writeback(fs, e);  /* written through a mapping since the last sync */
     for (struct e2ino **pp = &fs->inodes_live; *pp; pp = &(*pp)->next)
         if (*pp == e) { *pp = e->next; break; }
     pcache_free(e->pc);
@@ -1321,7 +1366,7 @@ static int e2_create(struct vnode *dir, const char *name, enum vtype t, uint32_t
         size_t tl = strlen(target);
         if (tl >= fs->bs) { r = -ENAMETOOLONG; goto undo; }
         if (tl < 60) memcpy(e->raw + I_BLOCK, target, tl);
-        else if ((r = (int)e2_write_locked(fs, e, target, tl, 0)) < 0) goto undo;
+        else if ((r = (int)e2_write_locked(fs, e, target, tl, 0, true)) < 0) goto undo;
         set_size(fs, e, tl);
     }
     inode_write(fs, e);
@@ -1424,7 +1469,7 @@ out:
 
 static const struct vnode_ops e2_file_ops = {
     .read = e2_read, .write = e2_write, .size = e2_size, .truncate = e2_truncate, .getpage = e2_getpage,
-    .readahead = e2_readahead,
+    .readahead = e2_readahead, .page_dirty = e2_page_dirty,
     .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr,
     .nolock = true,                                     /* fs->lock; block I/O takes the big lock itself */
 };
@@ -1447,7 +1492,11 @@ static int e2_sync(struct mount *m, bool final)
 {
     struct e2fs *fs = m->priv;
     if (fs->rdonly) return 0;
+    vm_sync_files();                                    /* writes through shared mappings: dirty pages */
     kmutex_lock(&fs->lock);
+    int werr = 0;
+    for (struct e2ino *e = fs->inodes_live; e; e = e->next)
+        if (pcache_dirty(e->pc)) { int r = writeback(fs, e); if (r && !werr) werr = r; }
     if (final) {                                        /* like an unmount: clean */
         p16(fs->sb + SB_STATE, 1);
         p32(fs->sb + SB_WTIME, now32());
@@ -1455,7 +1504,7 @@ static int e2_sync(struct mount *m, bool final)
     }
     int r = flush_all(fs);
     kmutex_unlock(&fs->lock);
-    return r;
+    return r ? r : werr;
 }
 
 static int e2_statfs(struct mount *m, struct kstatfs *st)

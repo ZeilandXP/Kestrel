@@ -12,8 +12,11 @@
  * The cache holds one reference to each of its pages (mm.h: page_ref);
  * mappings and readers hold their own. When free memory runs low the least
  * recently used files lose the pages nobody else holds: those are just
- * copies of the disk. Pages are never dirty here; the file system's own
- * write path keeps the disk up to date.
+ * copies of the disk. write() keeps the disk up to date through the file
+ * system's own path; a page written through a shared writable mapping is
+ * marked dirty (pcache_set_dirty, from the dirty bits of the page tables:
+ * vm.c) and stays until the file system has written it back
+ * (pcache_take_dirty).
  *
  * All operations take one spinlock, never across I/O; the file system
  * serialises filling a file's pages under its own lock. */
@@ -41,11 +44,18 @@ uint64_t pcache_insert(struct pcache *pc, uint64_t idx, uint64_t phys, bool ahea
 void     pcache_write(struct pcache *pc, const void *buf, size_t len, uint64_t off);
 /* The file is now `size` bytes: drop the pages past it, zero the tail. */
 void     pcache_truncate(struct pcache *pc, uint64_t size);
+/* Page `idx` was written through a shared mapping (no effect if it is not
+ * cached). */
+void     pcache_set_dirty(struct pcache *pc, uint64_t idx);
+/* The first dirty page at or after *idx, made clean, with a reference for
+ * the caller, its index in *idx; 0 if none. The caller writes it back. */
+uint64_t pcache_take_dirty(struct pcache *pc, uint64_t *idx);
+bool     pcache_dirty(struct pcache *pc);           /* any dirty page? */
 /* Release up to `want` pages nobody maps or reads, least recently used
  * files first. Returns the number freed. */
 uint64_t pcache_shrink(uint64_t want);
 
-struct pcache_stats { uint64_t files, pages, hits, misses, ahead, evicted; };
+struct pcache_stats { uint64_t files, pages, hits, misses, ahead, evicted, dirty; };
 void     pcache_stats(struct pcache_stats *s);
 
 #endif

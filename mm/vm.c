@@ -41,6 +41,7 @@
 #define PTE_P        0x001ull
 #define PTE_W        0x002ull
 #define PTE_U        0x004ull
+#define PTE_D        0x040ull           /* dirty: the CPU sets it on a write */
 #define PTE_HUGE     0x080ull
 #define PTE_COW      0x200ull           /* software: copy-on-write          */
 #define PTE_PROTNONE 0x400ull           /* software: frame kept, no access   */
@@ -54,6 +55,12 @@
 #define UVM_MMAP_END (UVM_STACK_TOP - UVM_STACK_SIZE - (1ull << 30))
 
 static bool nx_on;
+
+/* Every address space, for vm_sync_files(); and how many shared file
+ * regions exist (none: nothing to look for). */
+static struct spinlock mm_all_lock;
+static struct mm *mm_all;
+static int file_vmas;
 
 static uint64_t pgdown(uint64_t a) { return a & ~(PAGE - 1); }
 static uint64_t pgup(uint64_t a)   { return (a + PAGE - 1) & ~(PAGE - 1); }
@@ -210,6 +217,7 @@ static void dev_exit(bool entered) { if (entered) bkl_exit(); }
 
 static void vma_free(struct vma *v)
 {
+    if (v->flags & VMA_FILE) __atomic_sub_fetch(&file_vmas, 1, __ATOMIC_RELAXED);
     if (v->dops) { bool e = dev_enter(v->dops); v->dops->close(v->dctx); dev_exit(e); }
     if (v->obj) vmobj_put(v->obj);
     if (v->file) vfs_close(v->file);
@@ -233,6 +241,7 @@ static struct vma *vma_split(struct vma *v, uint64_t at)
     }
     if (n->obj) vmobj_get(n->obj);
     if (n->file) vfs_file_get(n->file);
+    if (n->flags & VMA_FILE) __atomic_add_fetch(&file_vmas, 1, __ATOMIC_RELAXED);
     v->end = at;
     v->next = n;
     return n;
@@ -260,6 +269,40 @@ static int split_at(struct mm *mm, uint64_t a)
     struct vma *v = vma_find(mm, a);
     if (v && v->start < a) return vma_split(v, a) ? 0 : -ENOMEM;
     return 0;
+}
+
+/* ---- shared file regions: dirty pages ------------------------------------------
+ * A shared file region maps the page cache's frames writable, so a write
+ * leaves no trace but the dirty bit the CPU sets in the page-table entry.
+ * harvest() hands those bits to the file's page cache and clears them;
+ * it runs before entries go (unmapping, exit) and for every address space
+ * from vm_sync_files(), which the file system calls before it writes
+ * back. mprotect and the PROT_NONE dance keep the bit. */
+struct harvest { struct vnode *vn; const struct vma *v; bool any; };
+
+static void harvest_fn(uint64_t *pte, uint64_t va, void *ctx)
+{
+    struct harvest *h = ctx;
+    if (!has_frame(*pte) || (*pte & PTE_PFN) || !(*pte & PTE_D)) return;
+    __atomic_and_fetch(pte, ~PTE_D, __ATOMIC_ACQ_REL);   /* the CPU may be setting A meanwhile */
+    h->vn->ops->page_dirty(h->vn, (h->v->off + (va - h->v->start)) / PAGE);
+    h->any = true;
+}
+
+/* mm locked. True if some bit was cleared: a CPU may still hold the
+ * translation with its dirty bit set (and would not set it again), so the
+ * caller shoots it down before the pages are written back. */
+static bool harvest(struct mm *mm, uint64_t start, uint64_t end)
+{
+    bool any = false;
+    if (!__atomic_load_n(&file_vmas, __ATOMIC_RELAXED)) return false;
+    for (struct vma *v = mm->vmas; v && v->start < end; v = v->next) {
+        if (!(v->flags & VMA_FILE) || v->end <= start) continue;
+        struct harvest h = { v->file->vn, v, false };
+        walk_range(mm->pml4, v->start > start ? v->start : start, v->end < end ? v->end : end, harvest_fn, &h);
+        any |= h.any;
+    }
+    return any;
 }
 
 /* Unmapping gathers the frames and frees them only after the TLB
@@ -291,8 +334,8 @@ static void zap_fn(uint64_t *pte, uint64_t va, void *ctx)
     if (z->n == ZAP_BATCH) zap_flush(z);
 }
 
-/* Unmap the pages of [start, end) (regions stay). */
-static void zap_range(struct mm *mm, uint64_t start, uint64_t end)
+/* Unmap the pages of [start, end) (regions stay); mm locked. */
+static void zap_pages(struct mm *mm, uint64_t start, uint64_t end)
 {
     struct zap z;                                       /* ~1 KiB of the 16 KiB kernel stack */
     z.mm = mm;
@@ -300,6 +343,13 @@ static void zap_range(struct mm *mm, uint64_t start, uint64_t end)
     z.dev = false;
     walk_range(mm->pml4, start, end, zap_fn, &z);
     zap_flush(&z);
+}
+
+/* The same, writes to shared file pages first handed to the page cache. */
+static void zap_range(struct mm *mm, uint64_t start, uint64_t end)
+{
+    harvest(mm, start, end);                            /* the zap shoots the translations down */
+    zap_pages(mm, start, end);
 }
 
 /* Remove [start, end) completely: pages and regions. */
@@ -344,6 +394,11 @@ struct mm *mm_create(void)
     mm->pml4 = uvm_create();
     if (!mm->pml4) { kfree(mm); return NULL; }
     mm->users = 1;
+    uint64_t f = spin_lock_irqsave(&mm_all_lock);
+    mm->all_next = mm_all;
+    if (mm_all) mm_all->all_prev = mm;
+    mm_all = mm;
+    spin_unlock_irqrestore(&mm_all_lock, f);
     return mm;
 }
 
@@ -383,6 +438,11 @@ void mm_put(struct mm *mm)
     if (mm_active(mm)) panic("mm_put: freeing the loaded address space");
     struct tcb *h = mm_holder(mm);
     if (h) panic("mm_put: pid %d (%s) still runs on this address space", h->pid, h->name);
+    uint64_t f = spin_lock_irqsave(&mm_all_lock);       /* vm_sync_files no longer finds it */
+    if (mm->all_prev) mm->all_prev->all_next = mm->all_next; else mm_all = mm->all_next;
+    if (mm->all_next) mm->all_next->all_prev = mm->all_prev;
+    spin_unlock_irqrestore(&mm_all_lock, f);
+    harvest(mm, 0, UVM_USER_END);                       /* loaded nowhere: no shootdown needed */
     while (mm->vmas) { struct vma *v = mm->vmas; mm->vmas = v->next; vma_free(v); }
     free_tables((uint64_t *)mm->pml4, 4);
     if (mm->kpml4) {                                    /* the window, and the kernel's root */
@@ -437,6 +497,7 @@ struct mm *mm_fork(struct mm *src)
         }
         if (n->obj) vmobj_get(n->obj);
         if (n->file) vfs_file_get(n->file);
+        if (n->flags & VMA_FILE) __atomic_add_fetch(&file_vmas, 1, __ATOMIC_RELAXED);
         vma_insert(dst, n);
         struct forkctx c = { dst, v, 0 };
         walk_range(src->pml4, v->start, v->end, fork_fn, &c);
@@ -508,6 +569,17 @@ static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t v
     uint64_t phys;
     struct tcb *t = current_task();
     t->fault_kind = (v->flags & VMA_SHARED) ? KF_SHARED : (v->file && va < v->file_end) ? KF_FILE : KF_ANON;
+    if (v->flags & VMA_FILE) {                          /* the page cache's frame itself */
+        if (fast) return -EAGAIN;
+        uint64_t off = v->off + (va - v->start);
+        if (off >= pgup(file_size(v->file))) return -EIO;   /* past EOF: SIGBUS */
+        int r = v->file->vn->ops->getpage(v->file->vn, off / PAGE, true, &phys);
+        if (r < 0) return r == -ENOMEM ? -ENOMEM : -EIO;
+        if (!phys) return -EIO;
+        *pte = phys | leaf_flags(v, writable);
+        mm->rss++;
+        return 0;
+    }
     if (!(v->flags & VMA_SHARED) && v->file && va < v->file_end && v->file->vn->ops &&
         v->file->vn->ops->getpage && va + PAGE <= v->file_end) {
         if (fast && !file_nolock(v->file)) return -EAGAIN;     /* its size needs the big lock */
@@ -601,7 +673,7 @@ static int fault_once(struct mm *mm, uint64_t addr, uint64_t err, bool fast)
     if ((e & PTE_PROTNONE) && fast) return -EAGAIN;
     if (e & PTE_PROTNONE) {                             /* rights came back (mprotect) */
         bool w = (v->prot & PROT_WRITE) && !(e & PTE_COW);
-        *pte = (e & ADDR_MASK) | (e & PTE_COW) | leaf_flags(v, w);
+        *pte = (e & ADDR_MASK) | (e & (PTE_COW | PTE_D)) | leaf_flags(v, w);
         return write && !w ? fault_cow(mm, v, pte, va) : 0;
     }
     return fault_missing(mm, v, pte, va, write, fast);
@@ -721,6 +793,60 @@ out:
     return r;
 }
 
+int64_t vm_mmap_file(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags, struct file *f, uint64_t off)
+{
+    if (!len) return -EINVAL;
+    len = pgup(len);
+    if (!len || len > UVM_USER_END - UVM_USER_START) return -ENOMEM;
+    if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) return -EINVAL;
+    struct vma *v = kzalloc(sizeof *v);
+    if (!v) return -ENOMEM;
+    mm_lock(mm);
+    int64_t r = place(mm, addr, len, flags);
+    if (r >= 0) {
+        v->start = (uint64_t)r;
+        v->end = (uint64_t)r + len;
+        v->prot = (uint32_t)prot;
+        v->flags = VMA_SHARED | VMA_FILE;
+        v->off = off;
+        v->file = vfs_file_get(f);
+        __atomic_add_fetch(&file_vmas, 1, __ATOMIC_RELAXED);
+        vma_insert(mm, v);
+        v = NULL;
+    }
+    mm_unlock(mm);
+    kfree(v);
+    if (r >= 0 && (flags & MAP_POPULATE)) vm_populate(mm, (uint64_t)r, len, false);
+    return r;
+}
+
+/* A reference to the address space after `prev` in the list (the first
+ * if NULL), skipping those on their way out; NULL at the end. */
+static struct mm *mm_next_ref(struct mm *prev)
+{
+    uint64_t f = spin_lock_irqsave(&mm_all_lock);
+    struct mm *m = prev ? prev->all_next : mm_all;
+    for (; m; m = m->all_next) {
+        int u = __atomic_load_n(&m->users, __ATOMIC_ACQUIRE);
+        while (u > 0 && !__atomic_compare_exchange_n(&m->users, &u, u + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+        if (u > 0) break;
+    }
+    spin_unlock_irqrestore(&mm_all_lock, f);
+    return m;
+}
+
+void vm_sync_files(void)
+{
+    if (!__atomic_load_n(&file_vmas, __ATOMIC_ACQUIRE)) return;
+    for (struct mm *m = mm_next_ref(NULL), *next; m; m = next) {
+        mm_lock(m);
+        if (harvest(m, 0, UVM_USER_END)) tlb_range(m, 0, UVM_USER_END);
+        mm_unlock(m);
+        next = mm_next_ref(m);                          /* m stays listed while we hold it */
+        mm_put(m);
+    }
+}
+
 int64_t vm_mmap_dev(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags, struct file *f, uint64_t off)
 {
     if (!len) return -EINVAL;
@@ -770,7 +896,7 @@ int vm_dev_insert(struct mm *mm, uint64_t va, uint64_t phys, uint64_t cache)
 
 void vm_dev_zap(struct mm *mm, uint64_t start, uint64_t end)
 {
-    zap_range(mm, pgdown(start), pgup(end));            /* device frames only: nothing to free */
+    zap_pages(mm, pgdown(start), pgup(end));            /* device frames only: nothing to free */
 }
 
 int vm_munmap(struct mm *mm, uint64_t addr, uint64_t len)
@@ -793,13 +919,14 @@ static void prot_fn(uint64_t *pte, uint64_t va, void *ctx)
     if (!has_frame(e)) return;
     if (e & PTE_PFN) { *pte = 0; return; }              /* device: faulted in again with the new rights */
     uint64_t frame = e & ADDR_MASK, cow = e & PTE_COW;
-    if (c->v->prot == PROT_NONE) { *pte = frame | cow | PTE_PROTNONE; return; }
+    uint64_t dirty = e & PTE_D;                         /* a shared file page's write not yet harvested */
+    if (c->v->prot == PROT_NONE) { *pte = frame | cow | dirty | PTE_PROTNONE; return; }
     /* a private page still shared with another process stays read-only
      * (copy-on-write) even if the region becomes writable */
     bool w = (c->v->prot & PROT_WRITE) && ((c->v->flags & VMA_SHARED) || page_refs(frame) == 1);
     if ((c->v->prot & PROT_WRITE) && !w && !(c->v->flags & VMA_SHARED)) cow = PTE_COW;
     if (w) cow = 0;
-    *pte = frame | cow | leaf_flags(c->v, w);
+    *pte = frame | cow | dirty | leaf_flags(c->v, w);
 }
 
 int vm_mprotect(struct mm *mm, uint64_t addr, uint64_t len, int prot)
@@ -820,6 +947,9 @@ int vm_mprotect(struct mm *mm, uint64_t addr, uint64_t len, int prot)
             r = -EACCES; goto out;                      /* F_SEAL_WRITE */
         }
         if ((prot & PROT_WRITE) && (v->flags & (VMA_VVAR | VMA_VDSO))) { r = -EACCES; goto out; }   /* shared by all */
+        if ((prot & PROT_WRITE) && (v->flags & VMA_FILE) && (v->file->flags & O_ACCMODE) != O_RDWR) {
+            r = -EACCES; goto out;                      /* the file was not opened for writing */
+        }
         a = v->end;
     }
     if ((r = split_at(mm, addr)) || (r = split_at(mm, end))) goto out;
@@ -891,7 +1021,7 @@ int64_t vm_mremap(struct mm *mm, uint64_t old, uint64_t olen, uint64_t nlen, int
     tlb_range(mm, old, old + olen);
     /* detach v and re-insert it at the new place */
     for (struct vma **pp = &mm->vmas; *pp; pp = &(*pp)->next) if (*pp == v) { *pp = v->next; break; }
-    if (v->file) v->file_end = v->file_end + (naddr - old);
+    if (v->file && !(v->flags & VMA_SHARED)) v->file_end = v->file_end + (naddr - old);
     v->start = naddr;
     v->end = naddr + nlen;
     vma_insert(mm, v);

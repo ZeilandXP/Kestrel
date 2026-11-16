@@ -91,6 +91,11 @@ struct vnode_ops {
      * page cache now in large requests, or for a large range read the file
      * in larger pieces from then on. Stops at the end of the file. */
     int     (*readahead)(struct vnode *vn, uint64_t idx, uint64_t count);
+    /* Optional, with getpage: page idx was written through a shared
+     * mapping (vm.c); mark it dirty in the page cache for write-back.
+     * Called with an address space locked: no sleeping, no file system
+     * lock. Files that have it can be mapped MAP_SHARED and writable. */
+    void    (*page_dirty)(struct vnode *vn, uint64_t idx);
     /* Optional: the time_ms() at which readiness may change on its own
      * (timerfd expiry), so poll/epoll sleep exactly that long. 0: never. */
     uint64_t (*poll_deadline)(struct file *f);

@@ -1107,6 +1107,7 @@ How it works:
 - **Inodes:** hard links share one in-memory copy of the raw on-disk inode, so fields Kestrel does not interpret survive a write.
 - **Write-back cache:** metadata and data go through a block cache (4 MiB per volume). A kernel thread writes dirty blocks every 5 seconds; `sync`, `fsync`, `poweroff` and `reboot` write everything.
 - **Page cache** (`mm/pagecache.c`): regular files are read through it, page by page. A page comes from the disk on first use, with its neighbours that are not cached yet and whose blocks follow on the disk, all in one request; a block the block cache holds is copied from there, as it may be newer. A page fault reads the aligned 128 KiB around it, so runs never overlap in part. A file read in order with `read()` is read ahead in a window that doubles from 128 KiB to 1 MiB; page faults never grow it. `readahead()`, `fadvise(WILLNEED)` and `madvise(MADV_WILLNEED)` read the first 1 MiB of the range at once and no more, as Linux caps them too. Firefox asks for all of `libxul.so` (187 MB) and both `omni.ja` files, of which it uses about half at start-up. With this cap a cold Firefox start reads 200 MB from the stick, the same as Linux 6.8. `mincore()` reports a file page as resident when the page cache holds it, mapped or not, as on Linux. Private mappings, which is to say every program and library, map the cached frames themselves, read-only: all the processes running Firefox share one copy of `libxul.so`, and only a write to a private mapping makes a copy of a page. A file fault also maps the neighbours already cached in its 64 KiB. Writes update cached pages as they go to the block cache, so the cache never needs writing back, and when memory runs low the least recently used files lose the pages nobody maps; `/proc/meminfo` counts them as `Cached` and in `MemAvailable`.
+- **Shared writable mappings:** `MAP_SHARED` of a file maps the page cache's frames themselves, writable, so `read()` and `write()` see a mapping's bytes at once and the other way round, and every process mapping the file shares one copy. A write through a mapping leaves only the dirty bit the CPU sets in the page table; at each write-back (every 5 seconds, `sync`, `fsync`, `msync(MS_SYNC)`, shutdown) and when a mapping goes (`munmap`, exit), those bits are handed to the page cache, which keeps dirty pages until the file system has written them through the block cache like `write()` would, allocating blocks for holes and stopping at the end of the file. `mprotect` keeps the bits. A page wholly past the end raises `SIGBUS`; `PROT_WRITE` needs a descriptor open for writing (`EACCES`), and so does adding it later with `mprotect`.
 - **Clean flag:** the superblock is marked clean only at shutdown, like an unmount on Linux, so `e2fsck` checks a volume that was not shut down cleanly.
 - **Untrusted disk:** nothing on it is trusted. Block numbers are range-checked before any I/O, and directory records are validated. A corrupt structure gives `EIO`, not a kernel fault.
 - **Free blocks:** new blocks come zeroed, so no stale data reaches a file, and an unlinked file that is still open keeps its blocks until the last close.
@@ -1121,15 +1122,17 @@ How it works:
 - **Record locks** (`fs/lockf.c`): `fcntl` read and write locks on byte ranges, POSIX (owned by the process, dropped when it closes any descriptor of the file) and open-file-description (`F_OFD_*`, dropped with the open file). SQLite, and with it Firefox's profile, depends on them.
 
 **Tests:**
-- `fstest` (in `/bin` on the root volume) runs 100 checks:
+- `fstest` (in `/bin` on the root volume) runs 115 checks:
   - files in every block-map class, sparse files, truncation, `O_APPEND`;
   - fast and slow symbolic links, link loops, `O_NOFOLLOW`;
   - hard links, renames of files and directories (and `..`), 400-entry directories;
   - unlinked open files, `chmod`/`chown`, `flock` and the extended-attribute calls;
   - inotify: create, modify (queued once), attribute, close, move with a shared cookie, delete, delete-self, `IN_IGNORED`, `IN_ONLYDIR`, `FIONREAD`;
+  - shared writable mappings: holes, `read()`/`write()` coherence both ways, `msync` allocating blocks, a forked child's writes, two mappings of one page, a private mapping beside them, `mprotect`, `SIGBUS` past the end, `EACCES`, a 3 MiB file synced while mapped;
   - `fcntl` record locks between two processes (conflicts, `F_GETLK` reporting the holder, `F_SETLKW` waiting, release on any close), `waitid` with `WNOWAIT`, reopening a descriptor through `/proc/self/fd`, memfd seals;
   - free space returning exactly to where it started.
-- `fstest -r` writes files, restarts the machine, and checks them after the reboot.
+- `fstest -r` writes files, restarts the machine, and checks them after the reboot, including one written through a mapping and one still mapped at the restart.
+- `fstest -a` writes a file through a mapping and never syncs; killing QEMU 12 seconds later, the file on the image (read with `debugfs`) holds every byte, written by the periodic write-back alone.
 - After each run, `e2fsck -fn` on the image finds no errors. This holds with 4 KiB blocks and 256-byte inodes, and with 1 KiB blocks and 128-byte inodes.
 - ext4: a 600 MB volume from a stock `mkfs.ext4 -d` boots as the root (`kestrel.rootfs=LABEL=...`, read-only). The checksums of a 50 MB file, a 300 MB sparse file and a file of 2000 separate extents (a tree of depth 2) match the host's, a 3000-entry directory (with its htree) lists in full, slow symbolic links read back, and writes fail with `EROFS`.
 
@@ -1151,7 +1154,6 @@ Alpine on another disk works too: put it on an ext2 partition, label it, and boo
 - A whole disk without a partition table is mounted read-only; a partition is mounted read-write.
 
 **Not yet:**
-- Shared writable `mmap` of disk files (read-only shared mappings work).
 - Writing to ext4 volumes that use extents (they mount read-only).
 - Device nodes, FIFOs and sockets on disk (`/dev` is devfs).
 - `mount(2)` for other volumes.

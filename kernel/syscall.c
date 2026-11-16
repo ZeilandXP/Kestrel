@@ -1134,8 +1134,10 @@ static int64_t sys_brk(uint64_t addr, uint64_t a2, uint64_t a3, uint64_t a4, uin
 /* mmap(2): anonymous (private or shared), private file mappings (filled from
  * the file on first touch, beyond EOF: SIGBUS), shared mappings of files
  * that keep their data in a vm_object (ramfs, memfd: coherent with
- * read/write), /dev/zero. A shared read-only mapping of another regular file
- * (the boot volume) is the same as a private one. */
+ * read/write), shared mappings of disk files (the page cache's frames,
+ * written back by the file system: vm_mmap_file), /dev/zero. A shared
+ * read-only mapping of another regular file (the boot volume) is the same
+ * as a private one. */
 #define MAP_KNOWN (MAP_TYPE | MAP_FIXED | MAP_ANONYMOUS | MAP_GROWSDOWN | MAP_DENYWRITE | MAP_EXECUTABLE | \
                    MAP_LOCKED | MAP_NORESERVE | MAP_POPULATE | MAP_NONBLOCK | MAP_STACK | MAP_FIXED_NOREPLACE)
 
@@ -1176,7 +1178,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
     }
     if (vn->type != VREG) { r = -ENODEV; goto out; }
     struct vm_object *o = shared ? vfs_vmobject(vn) : NULL;
-    if (shared && o) {
+    if (shared && !o && vn->ops && vn->ops->getpage && vn->ops->page_dirty) {
+        if ((prot & PROT_WRITE) && acc != O_RDWR) { r = -EACCES; goto out; }
+        r = vm_mmap_file(mm, addr, len, (int)prot, (int)flags, f, off);
+    } else if (shared && o) {
         if ((prot & PROT_WRITE) && acc != O_RDWR) { r = -EACCES; goto out; }
         if ((prot & PROT_WRITE) && (o->seals & 0x0008)) { r = -EPERM; goto out; }   /* F_SEAL_WRITE */
         r = vm_mmap(mm, addr, len, (int)prot, (int)flags, NULL, o, off, 0);
@@ -1224,11 +1229,15 @@ static int64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice, uint64_
     return 0;                                           /* hints: accepted */
 }
 
+/* msync(2): MS_SYNC writes back what shared mappings of disk files have
+ * written (every disk volume: simple and safe); MS_ASYNC leaves it to the
+ * file systems' periodic write-back, which looks at mappings too. */
 static int64_t sys_msync(uint64_t addr, uint64_t len, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)len; (void)a4; (void)a5; (void)a6;
     if ((addr & (UVM_PAGE - 1)) || (flags & ~7ull) || ((flags & 1) && (flags & 4))) return -EINVAL;
-    return 0;                                           /* shared mappings are the file's own pages */
+    if (flags & 4) vfs_sync_all(false);                 /* MS_SYNC */
+    return 0;
 }
 
 static int64_t sys_mincore(uint64_t addr, uint64_t len, uint64_t vec, uint64_t a4, uint64_t a5, uint64_t a6)
