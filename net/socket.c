@@ -1,10 +1,18 @@
-/* net/socket.c -- AF_INET sockets: the file side (see include/kernel/inet.h)
+/* net/socket.c -- AF_INET and AF_INET6 sockets: the file side (see include/kernel/inet.h)
  *
  * A socket is an anonymous VSOCK vnode inside a struct isock, like the
  * AF_UNIX ones. Binding checks the address is ours and the port free
  * (SO_REUSEADDR as on Linux: a listener's port stays taken, a closing
  * connection's does not); ports below 1024 need uid 0. Unbound sockets get
  * an ephemeral port (32768-60999) when they first send or connect.
+ *
+ * An AF_INET6 socket is an IPv4 socket that speaks sockaddr_in6: "::"
+ * binds every address (of both families, unless IPV6_V6ONLY), "::1" is the
+ * loopback and ::ffff:a.b.c.d is a.b.c.d; addresses come back the same
+ * way. With IPV6_V6ONLY it takes no mapped addresses, and binding "::" no
+ * longer takes the port from an IPv4 socket bound to it -- what servers
+ * that open one socket of each family expect (the IPv4 one is preferred
+ * for the IPv4 traffic that arrives).
  *
  * The interface ioctls (SIOCGIFADDR and friends, SIOCADDRT) work on any
  * socket, so ifconfig and route from BusyBox can read and change the
@@ -84,8 +92,9 @@ struct isock *isock_new(int type, int proto)
     return s;
 }
 
-int inet_create(int type, int protocol, struct file **out)
+int inet_create(int domain, int type, int protocol, struct file **out)
 {
+    if (domain != AF_INET && domain != AF_INET6) return -EAFNOSUPPORT;
     int flags = type & (SOCK_NONBLOCK | SOCK_CLOEXEC);
     type &= ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
     int proto;
@@ -95,10 +104,11 @@ int inet_create(int type, int protocol, struct file **out)
         proto = IPPROTO_TCP;
         break;
     case SOCK_DGRAM:
-        if (protocol && protocol != IPPROTO_UDP && protocol != IPPROTO_ICMP) return -EPROTONOSUPPORT;
+        if (protocol && protocol != IPPROTO_UDP && (protocol != IPPROTO_ICMP || domain == AF_INET6)) return -EPROTONOSUPPORT;
         proto = protocol ? protocol : IPPROTO_UDP;
         break;
     case SOCK_RAW:
+        if (domain == AF_INET6) return -EPROTONOSUPPORT;    /* no ICMPv6 */
         if (protocol != IPPROTO_ICMP && protocol != IPPROTO_RAW) return -EPROTONOSUPPORT;
         if (!capable(CAP_NET_RAW)) return -EPERM;
         proto = protocol;
@@ -108,6 +118,7 @@ int inet_create(int type, int protocol, struct file **out)
     }
     struct isock *s = isock_new(type, proto);
     if (!s) return -ENOMEM;
+    s->v6 = domain == AF_INET6;
     s->isolated = !netns_initial(current_task());
     uint64_t f = net_lock();
     if (s->isolated) {
@@ -140,6 +151,72 @@ static int get_sin(const void *addr, uint32_t len, struct sockaddr_in *sin)
     return 0;
 }
 
+static const uint8_t v4mapped[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+static const uint8_t v6loop[16] = { [15] = 1 };
+
+/* The IPv4 address a sockaddr_in6 means on this stack, into sin. why: what
+ * an IPv6 address we cannot reach is (-EADDRNOTAVAIL for bind, else
+ * -ENETUNREACH). ::1 marks the socket's loopback as ::1. */
+static int get_sin6(struct isock *s, const void *addr, uint32_t len, struct sockaddr_in *sin, int why)
+{
+    if (len < 24) return -EINVAL;                       /* SIN6_LEN_RFC2133: no scope id */
+    struct sockaddr_in6 a;
+    memset(&a, 0, sizeof a);
+    memcpy(&a, addr, len < sizeof a ? len : sizeof a);
+    if (a.sin6_family != AF_INET6) return -EAFNOSUPPORT;
+    memset(sin, 0, sizeof *sin);
+    sin->sin_family = AF_INET;
+    sin->sin_port = a.sin6_port;
+    static const uint8_t zero[16];
+    if (!memcmp(a.sin6_addr, zero, 16)) sin->sin_addr = 0;
+    else if (!memcmp(a.sin6_addr, v6loop, 16)) { sin->sin_addr = IP4(127, 0, 0, 1); s->lo6 = true; }
+    else if (!memcmp(a.sin6_addr, v4mapped, 12)) {
+        if (s->v6only) return why == -EADDRNOTAVAIL ? -EINVAL : -ENETUNREACH;
+        memcpy(&sin->sin_addr, a.sin6_addr + 12, 4);
+    } else return why;
+    return 0;
+}
+
+/* An address from user space, for this socket's family. An AF_INET6
+ * datagram socket takes a sockaddr_in too, as Linux does (unless V6ONLY). */
+static int get_addr(struct isock *s, const void *addr, uint32_t len, struct sockaddr_in *sin, int why)
+{
+    if (!s->v6) return get_sin(addr, len, sin);
+    if (len >= 2 && s->type != SOCK_STREAM && why != -EADDRNOTAVAIL) {
+        uint16_t fam;
+        memcpy(&fam, addr, 2);
+        if (fam == AF_INET) return s->v6only ? -EAFNOSUPPORT : get_sin(addr, len, sin);
+    }
+    return get_sin6(s, addr, len, sin, why);
+}
+
+void proc_addr(char out[40], uint32_t ip, uint16_t port, bool v6, bool lo6)
+{
+    if (!v6) { snprintf(out, 40, "%08X:%04X", ip, be16(port)); return; }
+    uint32_t w[4] = { 0, 0, ip ? be32(0xffff) : 0, ip };
+    if (lo6 && (ip & 0xff) == 127) { w[2] = 0; w[3] = be32(1); }
+    snprintf(out, 40, "%08X%08X%08X%08X:%04X", w[0], w[1], w[2], w[3], be16(port));
+}
+
+/* An address for user space in this socket's family. lo6: show the
+ * loopback as ::1 (else as ::ffff:127.0.0.1). */
+static void put_addr(struct isock *s, union inet_sa *out, uint32_t ip, uint16_t port, bool lo6)
+{
+    memset(out, 0, sizeof *out);
+    if (!s->v6) {
+        out->v4.sin_family = AF_INET;
+        out->v4.sin_addr = ip;
+        out->v4.sin_port = port;
+        return;
+    }
+    out->v6.sin6_family = AF_INET6;
+    out->v6.sin6_port = port;
+    if (!ip) return;                                    /* :: */
+    if (lo6 && (ip & 0xff) == 127) { memcpy(out->v6.sin6_addr, v6loop, 16); return; }
+    memcpy(out->v6.sin6_addr, v4mapped, 12);
+    memcpy(out->v6.sin6_addr + 12, &ip, 4);
+}
+
 static int autobind(struct isock *s)
 {
     if (s->lport) return 0;
@@ -157,11 +234,16 @@ int inet_bind(struct file *f, const void *addr, uint32_t len)
 {
     struct isock *s = isk(f);
     struct sockaddr_in sin;
-    if (len < sizeof sin) return -EINVAL;
-    memcpy(&sin, addr, sizeof sin);
-    if (sin.sin_family != AF_INET && !(sin.sin_family == 0 && sin.sin_addr == 0)) return -EAFNOSUPPORT;
     uint64_t fl = net_lock();
     int rc = 0;
+    bool lo6 = s->lo6;
+    if (s->v6) {
+        if ((rc = get_sin6(s, addr, len, &sin, -EADDRNOTAVAIL))) goto out;
+    } else {
+        if (len < sizeof sin) { rc = -EINVAL; goto out; }
+        memcpy(&sin, addr, sizeof sin);
+        if (sin.sin_family != AF_INET && !(sin.sin_family == 0 && sin.sin_addr == 0)) { rc = -EAFNOSUPPORT; goto out; }
+    }
     if (s->lport && s->type != SOCK_RAW) { rc = -EINVAL; goto out; }
     if (s->isolated) {          /* every interface is down: Linux takes any address, and nothing arrives */
         if (sin.sin_port && be16(sin.sin_port) < 1024 && !ns_capable(task_userns(current_task()), CAP_NET_BIND_SERVICE)) {
@@ -187,6 +269,7 @@ int inet_bind(struct file *f, const void *addr, uint32_t len)
     s->laddr = sin.sin_addr;
     s->lport = port;
 out:
+    if (rc) s->lo6 = lo6;
     net_unlock(fl);
     return rc;
 }
@@ -220,7 +303,7 @@ static int inet_connect_(struct file *f, const void *addr, uint32_t len)
             return 0;
         }
     }
-    int rc = get_sin(addr, len, &sin);
+    int rc = get_addr(s, addr, len, &sin, -ENETUNREACH);
     if (rc) return rc;
     if (s->isolated) return s->listening ? -EINVAL : -ENETUNREACH;
     if (s->type == SOCK_STREAM) return tcp_connect(s, f, sin.sin_addr, sin.sin_port);
@@ -251,7 +334,7 @@ static int isolated_wait(struct isock *s, struct file *f, int flags, bool ok)
     }
 }
 
-static int inet_accept_(struct file *f, int flags, struct file **out, struct sockaddr_in *peer)
+static int inet_accept_(struct file *f, int flags, struct file **out, union inet_sa *peer)
 {
     struct isock *s = isk(f);
     if (s->type != SOCK_STREAM) return -EOPNOTSUPP;
@@ -261,12 +344,7 @@ static int inet_accept_(struct file *f, int flags, struct file **out, struct soc
     if (rc) return rc;
     struct file *nf = vfs_file_new(&ns->vn, O_RDWR | ((flags & SOCK_NONBLOCK) ? O_NONBLOCK : 0));
     if (!nf) { uint64_t g = net_lock(); tcp_close(ns); net_unlock(g); kfree(ns); return -ENOMEM; }
-    if (peer) {
-        memset(peer, 0, sizeof *peer);
-        peer->sin_family = AF_INET;
-        peer->sin_addr = ns->raddr;
-        peer->sin_port = ns->rport;
-    }
+    if (peer) put_addr(ns, peer, ns->raddr, ns->rport, ns->lo6);
     *out = nf;
     return 0;
 }
@@ -309,9 +387,12 @@ static long inet_sendto_(struct file *f, const void *buf, size_t len, int flags,
     uint16_t dport;
     if (to && tolen) {
         struct sockaddr_in sin;
-        int rc = get_sin(to, tolen, &sin);
+        bool lo6 = s->lo6;
+        int rc = get_addr(s, to, tolen, &sin, -ENETUNREACH);
+        s->lo6 = lo6;                                   /* a destination, not the socket's own */
         if (rc) return rc;
         dst = sin.sin_addr;
+        if (s->v6 && !dst) dst = IP4(127, 0, 0, 1);    /* Linux: :: is the local host */
         dport = sin.sin_port;
     } else {
         if (!s->connected) return -EDESTADDRREQ;
@@ -330,22 +411,23 @@ static long inet_sendto_(struct file *f, const void *buf, size_t len, int flags,
     return rc;
 }
 
-static long inet_recvfrom_(struct file *f, void *buf, size_t len, int flags, struct sockaddr_in *from, int *msg_flags)
+static long inet_recvfrom_(struct file *f, void *buf, size_t len, int flags, union inet_sa *from, int *msg_flags)
 {
     struct isock *s = isk(f);
     if (s->isolated && s->type == SOCK_STREAM) return -ENOTCONN;
     if (s->isolated) return isolated_wait(s, f, flags, true);
     if (s->type == SOCK_STREAM) {
         long n = tcp_recv(s, f, buf, len, flags);
-        if (from && n >= 0) {
-            memset(from, 0, sizeof *from);
-            from->sin_family = AF_INET;
-            from->sin_addr = s->raddr;
-            from->sin_port = s->rport;
-        }
+        if (from && n >= 0) put_addr(s, from, s->raddr, s->rport, s->lo6);
         return n;
     }
-    return dgram_recv(s, f, buf, len, flags, from, msg_flags);
+    struct sockaddr_in sin;
+    long n = dgram_recv(s, f, buf, len, flags, from ? &sin : NULL, msg_flags);
+    if (from && n >= 0) {
+        bool lo6 = (sin.sin_addr & 0xff) == 127 && dgram_sender_v6(s->proto, sin.sin_addr, sin.sin_port);
+        put_addr(s, from, sin.sin_addr, sin.sin_port, lo6);
+    }
+    return n;
 }
 
 static int inet_shutdown_(struct file *f, int how)
@@ -363,9 +445,10 @@ static int inet_shutdown_(struct file *f, int how)
     return 0;
 }
 
-static int inet_name_(struct file *f, bool peer, struct sockaddr_in *out)
+static int inet_name_(struct file *f, bool peer, union inet_sa *res)
 {
     struct isock *s = isk(f);
+    struct sockaddr_in o, *out = &o;
     memset(out, 0, sizeof *out);
     out->sin_family = AF_INET;
     if (peer) {
@@ -373,8 +456,7 @@ static int inet_name_(struct file *f, bool peer, struct sockaddr_in *out)
                                                  tcp_info_state(s) != 2 && tcp_info_state(s) != 3
                                            : s->connected;
         if (!conn) return -ENOTCONN;
-        out->sin_addr = s->raddr;
-        out->sin_port = s->rport;
+        put_addr(s, res, s->raddr, s->rport, s->lo6);
         return 0;
     }
     out->sin_port = s->lport;
@@ -384,6 +466,7 @@ static int inet_name_(struct file *f, bool peer, struct sockaddr_in *out)
         out->sin_addr = tcp_local_addr(s);
     } else if (!s->laddr && s->connected) out->sin_addr = ip_source_for(s->raddr);
     if (s->type == SOCK_DGRAM && s->proto == IPPROTO_ICMP) out->sin_port = s->lport;
+    put_addr(s, res, out->sin_addr, out->sin_port, s->lo6);
     return 0;
 }
 
@@ -471,6 +554,25 @@ static int inet_setsockopt_(struct file *f, int level, int opt, const void *val,
         }
         return -ENOPROTOOPT;
     }
+    if (level == SOL_IPV6) {
+        if (!s->v6) return -ENOPROTOOPT;
+        int rc = opt_int(val, len, &v);
+        if (rc) return rc;
+        switch (opt) {
+        case IPV6_V6ONLY:
+            if (s->lport && s->type != SOCK_RAW) return -EINVAL;   /* Linux: only before bind */
+            s->v6only = v != 0;
+            return 0;
+        case IPV6_UNICAST_HOPS: if (v == -1) v = 64; if (v < 0 || v > 255) return -EINVAL; s->ttl = v ? (uint8_t)v : 64; break;
+        case IPV6_TCLASS: if (v == -1) v = 0; if (v < 0 || v > 255) return -EINVAL; s->tos = (uint8_t)v; break;
+        case IPV6_MULTICAST_IF: case IPV6_MULTICAST_HOPS: case IPV6_MULTICAST_LOOP: case IPV6_MTU_DISCOVER:
+        case IPV6_RECVERR: case IPV6_RECVPKTINFO: case IPV6_DONTFRAG: case IPV6_RECVTCLASS: case IPV6_ADDR_PREFERENCES:
+            return 0;
+        default: return -ENOPROTOOPT;
+        }
+        if (s->tcb) { uint64_t fl = net_lock(); tcp_setopt_nodelay(s); net_unlock(fl); }
+        return 0;
+    }
     if (level == SOL_UDP) return 0;
     return -ENOPROTOOPT;
 }
@@ -483,7 +585,7 @@ static int inet_getsockopt_(struct file *f, int level, int opt, void *val, uint3
         switch (opt) {
         case SO_TYPE:      v = s->type; break;
         case SO_PROTOCOL:  v = s->proto; break;
-        case SO_DOMAIN:    v = AF_INET; break;
+        case SO_DOMAIN:    v = s->v6 ? AF_INET6 : AF_INET; break;
         case SO_ERROR: {
             uint64_t fl = net_lock();
             v = s->err;
@@ -520,6 +622,16 @@ static int inet_getsockopt_(struct file *f, int level, int opt, void *val, uint3
         switch (opt) {
         case IP_TTL: v = s->ttl; break;
         case IP_TOS: v = s->tos; break;
+        default: return -ENOPROTOOPT;
+        }
+    } else if (level == SOL_IPV6) {
+        if (!s->v6) return -ENOPROTOOPT;
+        switch (opt) {
+        case IPV6_V6ONLY:       v = s->v6only; break;
+        case IPV6_UNICAST_HOPS: v = s->ttl; break;
+        case IPV6_TCLASS:       v = s->tos; break;
+        case IPV6_MULTICAST_HOPS: v = 1; break;
+        case IPV6_MULTICAST_LOOP: v = 1; break;
         default: return -ENOPROTOOPT;
         }
     } else if (level == SOL_TCP) {
@@ -702,7 +814,7 @@ static int net_ioctl_(unsigned long req, void *arg)
 
 /* ---- file operations ------------------------------------------------------------------- */
 long inet_sendto(struct file *f, const void *buf, size_t len, int flags, const void *to, uint32_t tolen);
-long inet_recvfrom(struct file *f, void *buf, size_t len, int flags, struct sockaddr_in *from, int *msg_flags);
+long inet_recvfrom(struct file *f, void *buf, size_t len, int flags, union inet_sa *from, int *msg_flags);
 static ssize_t inet_fread(struct file *f, void *buf, size_t len) { return inet_recvfrom(f, buf, len, 0, NULL, NULL); }
 static ssize_t inet_fwrite(struct file *f, const void *buf, size_t len) { return inet_sendto(f, buf, len, 0, NULL, 0); }
 
@@ -763,11 +875,11 @@ static const struct vnode_ops inet_ops = {
 #define ENTRY(type, call) do { uint64_t fl_ = net_lock(); type r_ = call; net_lo_flush(); net_unlock(fl_); return r_; } while (0)
 int inet_connect(struct file *f, const void *addr, uint32_t len)
 { ENTRY(int, inet_connect_(f, addr, len)); }
-int inet_accept(struct file *f, int flags, struct file **out, struct sockaddr_in *peer)
+int inet_accept(struct file *f, int flags, struct file **out, union inet_sa *peer)
 { ENTRY(int, inet_accept_(f, flags, out, peer)); }
 long inet_sendto(struct file *f, const void *buf, size_t len, int flags, const void *to, uint32_t tolen)
 { ENTRY(long, inet_sendto_(f, buf, len, flags, to, tolen)); }
-long inet_recvfrom(struct file *f, void *buf, size_t len, int flags, struct sockaddr_in *from, int *msg_flags)
+long inet_recvfrom(struct file *f, void *buf, size_t len, int flags, union inet_sa *from, int *msg_flags)
 { ENTRY(long, inet_recvfrom_(f, buf, len, flags, from, msg_flags)); }
 int inet_shutdown(struct file *f, int how)
 { ENTRY(int, inet_shutdown_(f, how)); }
@@ -775,7 +887,7 @@ int inet_setsockopt(struct file *f, int level, int opt, const void *val, uint32_
 { ENTRY(int, inet_setsockopt_(f, level, opt, val, len)); }
 int inet_getsockopt(struct file *f, int level, int opt, void *val, uint32_t *len)
 { ENTRY(int, inet_getsockopt_(f, level, opt, val, len)); }
-int inet_name(struct file *f, bool peer, struct sockaddr_in *out)
+int inet_name(struct file *f, bool peer, union inet_sa *out)
 { ENTRY(int, inet_name_(f, peer, out)); }
 int net_ifconf(void *kbuf, int len)
 { ENTRY(int, net_ifconf_(kbuf, len)); }

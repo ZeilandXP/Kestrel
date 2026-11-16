@@ -176,8 +176,8 @@ bool dhcp_busy(void);
 void dhcp_stop(struct netif *nif);       /* user space configures nif itself now */
 
 void net_proc_init(void);
-size_t tcp_proc(char *buf, size_t cap);
+size_t tcp_proc(char *buf, size_t cap, bool v6);    /* v6: tcp6, the AF_INET6 sockets */
 size_t tcp_snmp(char *buf, size_t cap);         /* the "Tcp:" lines of /proc/net/snmp */
-size_t udp_proc(char *buf, size_t cap);
+size_t udp_proc(char *buf, size_t cap, bool v6);
 
 #endif

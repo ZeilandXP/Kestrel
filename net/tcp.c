@@ -378,10 +378,14 @@ static void tcp_output(struct tcpcb *t)
 static struct tcpcb *find(uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport)
 {
     struct tcpcb *lst = NULL;
+    int best = -1;
     for (struct tcpcb *t = tcbs; t; t = t->next) {
         if (t->lport != dport) continue;
         if (t->state == LISTEN) {
-            if (!t->laddr || t->laddr == dst) { if (!lst || t->laddr) lst = t; }
+            /* a listener on this address before one on any; one that takes
+             * IPv4 before an IPV6_V6ONLY one beside it (net/socket.c) */
+            int sc = (t->laddr ? 2 : 0) + (t->sock && t->sock->v6only ? 0 : 1);
+            if ((!t->laddr || t->laddr == dst) && sc > best) { best = sc; lst = t; }
             continue;
         }
         if (t->state != CLOSED && t->raddr == src && t->rport == sport && t->laddr == dst) return t;
@@ -394,6 +398,7 @@ bool tcp_port_used(uint32_t addr, uint16_t port, struct isock *except, bool reus
     for (struct tcpcb *t = tcbs; t; t = t->next) {
         if (t->lport != port || (except && t == except->tcb)) continue;
         if (t->laddr && addr && t->laddr != addr) continue;
+        if (except && !same_family_space(except, t->sock)) continue;
         if (t->state == CLOSED && !t->sock) continue;
         /* SO_REUSEADDR: a port whose connections are only closing may be reused */
         if (reuse && t->state != LISTEN) continue;
@@ -1001,6 +1006,14 @@ int tcp_accept(struct isock *s, struct file *f, struct isock **out)
     ns->laddr = t->laddr; ns->lport = t->lport;
     ns->raddr = t->raddr; ns->rport = t->rport;
     ns->nodelay = t->nodelay; ns->keepalive = t->keepalive;
+    ns->v6 = s->v6; ns->v6only = s->v6only;
+    if (s->v6 && (t->raddr & 0xff) == 127) {           /* a loopback peer: is it an AF_INET6 socket */
+        for (struct tcpcb *p = tcbs; p; p = p->next)
+            if (p != t && p->lport == t->rport && p->rport == t->lport && p->laddr == t->raddr && p->raddr == t->laddr) {
+                ns->lo6 = p->sock && p->sock->v6;
+                break;
+            }
+    }
     if (t->keepalive) set_timer(&t->keep_at, net_now() + KEEP_IDLE_MS);
     *out = ns;
     net_unlock(fl);
@@ -1215,14 +1228,23 @@ int tcp_sock_error(struct isock *s, bool clear)
 const char *tcp_state_name(struct isock *s) { return s->tcb ? state_names[s->tcb->state] : "CLOSED"; }
 
 /* /proc/net/tcp, Linux layout */
-size_t tcp_proc(char *buf, size_t cap)
+/* /proc/net/tcp, or tcp6 (the AF_INET6 sockets', their addresses v4-mapped) */
+size_t tcp_proc(char *buf, size_t cap, bool v6)
 {
-    size_t n = (size_t)snprintf(buf, cap, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
+    size_t n = (size_t)snprintf(buf, cap, v6 ?
+        "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n" :
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
     int i = 0;
     for (struct tcpcb *t = tcbs; t && n < cap; t = t->next) {
         if (t->state == CLOSED) continue;
-        n += (size_t)snprintf(buf + n, cap - n, "%4d: %08X:%04X %08X:%04X %02X %08X:%08X 00:00000000 %08X     0        0 0\n",
-                              i++, t->laddr, be16(t->lport), t->raddr, be16(t->rport), linux_state[t->state],
+        /* an accepted connection not yet accepted belongs to its listener's family */
+        struct isock *o = t->sock ? t->sock : t->listener ? t->listener->sock : NULL;
+        if ((o && o->v6) != v6) continue;
+        char la[40], ra[40];
+        proc_addr(la, t->laddr, t->lport, v6, o && o->lo6);
+        proc_addr(ra, t->raddr, t->rport, v6, o && o->lo6);
+        n += (size_t)snprintf(buf + n, cap - n, "%4d: %s %s %02X %08X:%08X 00:00000000 %08X     0        0 0\n",
+                              i++, la, ra, linux_state[t->state],
                               t->sbuf_len, t->state == LISTEN ? (unsigned)t->aq_len : t->rbuf_len, (unsigned)t->retries);
     }
     return n < cap ? n : cap;

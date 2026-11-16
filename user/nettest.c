@@ -1,4 +1,5 @@
 /* user/nettest.c -- AF_INET sockets on Kestrel: UDP, TCP, ICMP, interfaces;
+ * AF_INET6 dual-stack sockets (v4-mapped addresses, ::1, IPV6_V6ONLY);
  * netlink (rtnetlink, getifaddrs) and packet sockets with BPF filters
  *
  *   nettest                       loopback checks only
@@ -431,6 +432,176 @@ static void test_udp(void)
     close(a); close(b); close(c); close(d);
 }
 
+/* ---- AF_INET6: dual-stack sockets on the IPv4 stack ------------------------------- */
+static struct sockaddr_in6 sin6_of(const char *ip, int port)
+{
+    struct sockaddr_in6 a = { .sin6_family = AF_INET6, .sin6_port = htons((uint16_t)port) };
+    inet_pton(AF_INET6, ip, &a.sin6_addr);
+    return a;
+}
+
+static const char *ntop6(const struct sockaddr_in6 *a, char *buf)
+{
+    return inet_ntop(AF_INET6, &a->sin6_addr, buf, INET6_ADDRSTRLEN);
+}
+
+static void test_ipv6(void)
+{
+    char t1[INET6_ADDRSTRLEN], t2[INET6_ADDRSTRLEN];
+    int l = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(l >= 0, "AF_INET6 TCP socket");
+    int v = -1;
+    socklen_t vl = sizeof v;
+    CHECK(getsockopt(l, SOL_SOCKET, SO_DOMAIN, &v, &vl) == 0 && v == AF_INET6, "AF_INET6: SO_DOMAIN");
+    v = -1;
+    CHECK(getsockopt(l, IPPROTO_IPV6, IPV6_V6ONLY, &v, &vl) == 0 && v == 0, "IPV6_V6ONLY is off by default");
+    struct sockaddr_in6 any = sin6_of("::", 0);
+    CHECK(bind(l, (struct sockaddr *)&any, sizeof any) == 0 && listen(l, 8) == 0, "AF_INET6 TCP bind [::]:0, listen");
+    struct sockaddr_in6 me;
+    socklen_t ml = sizeof me;
+    CHECK(getsockname(l, (struct sockaddr *)&me, &ml) == 0 && ml == sizeof me && me.sin6_family == AF_INET6 &&
+          IN6_IS_ADDR_UNSPECIFIED(&me.sin6_addr) && me.sin6_port, "AF_INET6 getsockname: [::]:port, 28 bytes");
+    int port = ntohs(me.sin6_port);
+    /* an IPv4 client reaches it: the peer is v4-mapped */
+    int c4 = tcp_connect_to("127.0.0.1", port);
+    CHECK(c4 >= 0, "IPv4 client connects to the [::] listener");
+    struct sockaddr_in6 peer;
+    socklen_t pl = sizeof peer;
+    int a4 = accept(l, (struct sockaddr *)&peer, &pl);
+    CHECK(a4 >= 0 && pl == sizeof peer && peer.sin6_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&peer.sin6_addr) &&
+          !strcmp(ntop6(&peer, t1), "::ffff:127.0.0.1") && ntohs(peer.sin6_port) == port_of(c4),
+          "accept: the IPv4 peer as ::ffff:127.0.0.1");
+    if (a4 >= 0) {
+        write(c4, "v4", 2);
+        char b[4] = { 0 };
+        CHECK(read(a4, b, 2) == 2 && !memcmp(b, "v4", 2), "data from the IPv4 client");
+        close(a4);
+    }
+    close(c4);
+    /* an AF_INET6 client to ::1 */
+    int c6 = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 lo = sin6_of("::1", port);
+    CHECK(connect(c6, (struct sockaddr *)&lo, sizeof lo) == 0, "AF_INET6 connect to [::1]");
+    pl = sizeof peer;
+    int a6 = accept(l, (struct sockaddr *)&peer, &pl);
+    CHECK(a6 >= 0 && !strcmp(ntop6(&peer, t1), "::1"), "accept: an AF_INET6 peer on the loopback as ::1");
+    struct sockaddr_in6 cn, cp;
+    socklen_t cnl = sizeof cn, cpl = sizeof cp;
+    CHECK(getsockname(c6, (struct sockaddr *)&cn, &cnl) == 0 && getpeername(c6, (struct sockaddr *)&cp, &cpl) == 0 &&
+          !strcmp(ntop6(&cn, t1), "::1") && !strcmp(ntop6(&cp, t2), "::1") && ntohs(cp.sin6_port) == port,
+          "AF_INET6 client: getsockname and getpeername are [::1]");
+    if (a6 >= 0) {
+        write(a6, "six", 3);
+        char b[4] = { 0 };
+        CHECK(read(c6, b, 3) == 3 && !memcmp(b, "six", 3), "data over [::1]");
+        close(a6);
+    }
+    close(c6);
+    /* a v4-mapped destination */
+    c6 = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 mapped = sin6_of("::ffff:127.0.0.1", port);
+    CHECK(connect(c6, (struct sockaddr *)&mapped, sizeof mapped) == 0, "AF_INET6 connect to [::ffff:127.0.0.1]");
+    a6 = accept(l, NULL, NULL);
+    cpl = sizeof cp;
+    CHECK(getpeername(c6, (struct sockaddr *)&cp, &cpl) == 0 && !strcmp(ntop6(&cp, t1), "::ffff:127.0.0.1"),
+          "getpeername: ::ffff:127.0.0.1");
+    close(a6); close(c6);
+    /* an IPv6 address we have no route to */
+    c6 = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 far = sin6_of("2001:db8::1", 80);
+    CHECK(connect(c6, (struct sockaddr *)&far, sizeof far) < 0 && errno == ENETUNREACH, "connect to 2001:db8::1: ENETUNREACH");
+    CHECK(bind(c6, (struct sockaddr *)&far, sizeof far) < 0 && errno == EADDRNOTAVAIL, "bind to 2001:db8::1: EADDRNOTAVAIL");
+    struct sockaddr_in sin = sin_of("127.0.0.1", 0);
+    CHECK(bind(c6, (struct sockaddr *)&sin, sizeof sin) < 0 && errno == EINVAL, "AF_INET6 bind with a 16-byte sockaddr_in: EINVAL");
+    struct sockaddr_in6 wrong = sin6_of("::", 0);
+    wrong.sin6_family = AF_INET;
+    CHECK(bind(c6, (struct sockaddr *)&wrong, sizeof wrong) < 0 && errno == EAFNOSUPPORT, "AF_INET6 bind with family AF_INET: EAFNOSUPPORT");
+    close(c6);
+    /* /proc/net/tcp6 lists the listener */
+    char want[64], line[256];
+    snprintf(want, sizeof want, "00000000000000000000000000000000:%04X", port);
+    FILE *pf = fopen("/proc/net/tcp6", "r");
+    int seen = 0;
+    while (pf && fgets(line, sizeof line, pf)) if (strstr(line, want) && strstr(line, " 0A ")) seen = 1;
+    if (pf) fclose(pf);
+    CHECK(seen, "/proc/net/tcp6 lists the [::] listener");
+    close(l);
+
+    /* IPV6_V6ONLY beside an IPv4 socket on the same port, the way servers do it */
+    int s4 = socket(AF_INET, SOCK_STREAM, 0), s6 = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in a = sin_of("0.0.0.0", 0);
+    bind(s4, (struct sockaddr *)&a, sizeof a);
+    listen(s4, 4);
+    int p2 = port_of(s4);
+    struct sockaddr_in6 any2 = sin6_of("::", p2);
+    int dual = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(bind(dual, (struct sockaddr *)&any2, sizeof any2) < 0 && errno == EADDRINUSE, "dual-stack [::] on an IPv4 socket's port: EADDRINUSE");
+    close(dual);
+    int one = 1;
+    CHECK(setsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) == 0, "IPV6_V6ONLY on");
+    CHECK(bind(s6, (struct sockaddr *)&any2, sizeof any2) == 0 && listen(s6, 4) == 0, "V6ONLY [::] beside 0.0.0.0 on the same port");
+    CHECK(setsockopt(s6, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) < 0 && errno == EINVAL, "IPV6_V6ONLY after bind: EINVAL");
+    int c = tcp_connect_to("127.0.0.1", p2);
+    struct pollfd pp[2] = { { s4, POLLIN, 0 }, { s6, POLLIN, 0 } };
+    poll(pp, 2, 2000);
+    CHECK((pp[0].revents & POLLIN) && !(pp[1].revents & POLLIN), "an IPv4 client goes to the IPv4 socket");
+    close(c);
+    int v6c = socket(AF_INET6, SOCK_STREAM, 0);
+    CHECK(setsockopt(v6c, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) == 0, "V6ONLY client");
+    struct sockaddr_in6 m2 = sin6_of("::ffff:127.0.0.1", p2);
+    CHECK(connect(v6c, (struct sockaddr *)&m2, sizeof m2) < 0 && errno == ENETUNREACH, "V6ONLY connect to a mapped address: ENETUNREACH");
+    close(v6c); close(s4); close(s6);
+
+    /* UDP */
+    int u6 = socket(AF_INET6, SOCK_DGRAM, 0), u4 = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in6 ua = sin6_of("::", 0);
+    CHECK(bind(u6, (struct sockaddr *)&ua, sizeof ua) == 0, "AF_INET6 UDP bind [::]:0");
+    struct sockaddr_in6 un;
+    socklen_t unl = sizeof un;
+    getsockname(u6, (struct sockaddr *)&un, &unl);
+    int up = ntohs(un.sin6_port);
+    struct sockaddr_in to4 = sin_of("127.0.0.1", up);
+    sendto(u4, "four", 4, 0, (struct sockaddr *)&to4, sizeof to4);
+    char b[16];
+    struct sockaddr_in6 from;
+    socklen_t fl = sizeof from;
+    ssize_t n = recvfrom(u6, b, sizeof b, 0, (struct sockaddr *)&from, &fl);
+    CHECK(n == 4 && fl == sizeof from && !strcmp(ntop6(&from, t1), "::ffff:127.0.0.1") && ntohs(from.sin6_port) == port_of(u4),
+          "UDP: an IPv4 sender as ::ffff:127.0.0.1");
+    /* reply to the address it came from */
+    CHECK(sendto(u6, "back", 4, 0, (struct sockaddr *)&from, fl) == 4, "UDP sendto a v4-mapped address");
+    n = recv(u4, b, sizeof b, 0);
+    CHECK(n == 4 && !memcmp(b, "back", 4), "the IPv4 socket gets the answer");
+    int u6b = socket(AF_INET6, SOCK_DGRAM, 0);
+    struct sockaddr_in6 ul = sin6_of("::1", up);
+    CHECK(sendto(u6b, "lo6", 3, 0, (struct sockaddr *)&ul, sizeof ul) == 3, "UDP sendto [::1]");
+    fl = sizeof from;
+    n = recvfrom(u6, b, sizeof b, 0, (struct sockaddr *)&from, &fl);
+    CHECK(n == 3 && !strcmp(ntop6(&from, t1), "::1"), "UDP: an AF_INET6 sender as ::1");
+    struct iovec iov = { b, sizeof b };
+    struct sockaddr_in6 mfrom;
+    struct msghdr mh = { .msg_name = &mfrom, .msg_namelen = sizeof mfrom, .msg_iov = &iov, .msg_iovlen = 1 };
+    sendto(u4, "msg", 3, 0, (struct sockaddr *)&to4, sizeof to4);
+    n = recvmsg(u6, &mh, 0);
+    CHECK(n == 3 && mh.msg_namelen == sizeof mfrom && IN6_IS_ADDR_V4MAPPED(&mfrom.sin6_addr), "UDP recvmsg: a 28-byte v4-mapped name");
+    v = 0;
+    CHECK(setsockopt(u6b, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &(int){ 7 }, sizeof(int)) == 0 &&
+          getsockopt(u6b, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &v, &vl) == 0 && v == 7, "IPV6_UNICAST_HOPS");
+    CHECK(setsockopt(u4, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) < 0 && errno == ENOPROTOOPT, "IPv6 options on an AF_INET socket: ENOPROTOOPT");
+    snprintf(want, sizeof want, "00000000000000000000000000000000:%04X", up);
+    pf = fopen("/proc/net/udp6", "r");
+    seen = 0;
+    while (pf && fgets(line, sizeof line, pf)) if (strstr(line, want)) seen = 1;
+    if (pf) fclose(pf);
+    CHECK(seen, "/proc/net/udp6 lists the socket");
+    close(u6); close(u4); close(u6b);
+    /* getaddrinfo with AF_UNSPEC for a numeric address in each family */
+    struct addrinfo hints = { .ai_family = AF_INET6, .ai_socktype = SOCK_STREAM }, *res = NULL;
+    CHECK(getaddrinfo("::1", "80", &hints, &res) == 0 && res && res->ai_family == AF_INET6, "getaddrinfo(\"::1\")");
+    if (res) freeaddrinfo(res);
+    CHECK(socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6) < 0 && errno == EPROTONOSUPPORT, "AF_INET6 raw ICMPv6: EPROTONOSUPPORT");
+}
+
 /* ---- TCP --------------------------------------------------------------------------- */
 #define BULK (8u << 20)
 
@@ -668,6 +839,16 @@ static void test_remote(const char *hostport)
     CHECK(good >= 18, "UDP through the network card: datagrams echoed by the host");
     printf("nettest:        %d of 20 datagrams came back\n", good);
     close(u);
+    /* AF_INET6 to the host's v4-mapped address, as a dual-stack client does */
+    int t6 = socket(AF_INET6, SOCK_STREAM, 0);
+    char m6[80];
+    snprintf(m6, sizeof m6, "::ffff:%s", host);
+    struct sockaddr_in6 h6 = sin6_of(m6, port);
+    int ok6 = connect(t6, (struct sockaddr *)&h6, sizeof h6) == 0 && write(t6, "mapped", 6) == 6;
+    char back6[8] = { 0 };
+    ok6 = ok6 && read_all(t6, back6, 6) == 6 && !memcmp(back6, "mapped", 6);
+    CHECK(ok6, "AF_INET6 TCP to the host at a v4-mapped address: echoed");
+    close(t6);
     /* Name servers: /etc/resolv.conf links to /proc/net/pnp, filled by DHCP */
     fd = open("/etc/resolv.conf", O_RDONLY);
     n = fd >= 0 ? read(fd, rbuf, sizeof rbuf - 1) : -1;
@@ -715,6 +896,7 @@ int main(int argc, char **argv)
     test_udp();
     test_tcp_basic();
     test_tcp_bulk();
+    test_ipv6();
     if (argc > 1) test_remote(argv[1]);
     printf(failures ? "nettest: FAILED (%d)\n" : "nettest: all checks passed\n", failures);
     return failures ? 1 : 0;

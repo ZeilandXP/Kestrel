@@ -2239,7 +2239,7 @@ static int64_t sys_socket(uint64_t dom, uint64_t type, uint64_t proto, uint64_t 
 {
     (void)a4; (void)a5; (void)a6;
     struct file *f;
-    int rc = dom == AF_INET ? inet_create((int)type, (int)proto, &f)
+    int rc = dom == AF_INET || dom == AF_INET6 ? inet_create((int)dom, (int)type, (int)proto, &f)
            : dom == AF_NETLINK || dom == AF_PACKET ? xsock_create((int)dom, (int)type, (int)proto, &f)
            : usock_create((int)dom, (int)type, (int)proto, &f);
     return rc ? rc : install(f, type & SOCK_CLOEXEC);
@@ -2306,10 +2306,10 @@ static int64_t sys_accept4(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t f
     uint32_t got = sizeof a;
     if (xsock_is(f)) { fput(f); return -EOPNOTSUPP; }
     if (inet_is(f)) {
-        struct sockaddr_in sin;
+        union inet_sa sin;
         rc = inet_accept(f, (int)flags, &nf, &sin);
         memcpy(&a, &sin, sizeof sin);
-        got = sizeof sin;
+        got = inet_sa_len(&sin);
     } else rc = usock_accept(f, (int)flags, &nf, &a, &got);
     fput(f);
     if (rc) return rc;
@@ -2337,7 +2337,7 @@ static int64_t sock_xfer(struct file *f, uint64_t ubuf, uint64_t len, int flags,
  * a blocking stream send queues everything, chunk by chunk; a receive
  * returns what one call gets. */
 static int64_t inet_xfer(struct file *f, uint64_t ubuf, uint64_t len, int flags, bool send,
-                         const struct sockaddr_un *to, uint32_t tolen, struct sockaddr_in *from, int *mflags)
+                         const struct sockaddr_un *to, uint32_t tolen, union inet_sa *from, int *mflags)
 {
     bool stream = inet_type(f) == SOCK_STREAM;
     if (len && !ubuf_ok(ubuf, len)) return -EFAULT;
@@ -2422,10 +2422,11 @@ static int64_t sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fl
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
     if (inet_is(f)) {
-        struct sockaddr_in from;
+        union inet_sa from;
+        from.v4.sin_family = AF_INET;
         rc = inet_xfer(f, buf, len, (int)flags, false, NULL, 0, &from, NULL);
         fput(f);
-        if (rc >= 0 && addr && alenp && (int64_t)put_sockaddr(addr, alenp, (const struct sockaddr_un *)&from, sizeof from)) return -EFAULT;
+        if (rc >= 0 && addr && alenp && (int64_t)put_sockaddr(addr, alenp, (const struct sockaddr_un *)&from, inet_sa_len(&from))) return -EFAULT;
         return rc;
     }
     if (xsock_is(f)) {
@@ -2550,7 +2551,7 @@ static int64_t inet_msg_io(struct file *f, struct msghdr_k *m, uint64_t umsg, ui
             if ((size_t)n < want || !stream) break;
         } while ((uint64_t)total < len);
     } else {
-        struct sockaddr_in from;
+        union inet_sa from;
         int mflags = 0;
         long n = inet_recvfrom(f, kb, chunk < len ? chunk : (size_t)len, (int)flags, &from, &mflags);
         if (n < 0) { total = n; goto out; }
@@ -2558,9 +2559,10 @@ static int64_t inet_msg_io(struct file *f, struct msghdr_k *m, uint64_t umsg, ui
         if (sock_io_copy(&cur, kb, got, true)) { total = -EFAULT; goto out; }
         total = n;
         if (m->name) {
-            uint32_t nl = m->namelen < sizeof from ? m->namelen : (uint32_t)sizeof from;
+            uint32_t fl = inet_sa_len(&from);
+            uint32_t nl = m->namelen < fl ? m->namelen : fl;
             if (nl && copy_to_user((void *)m->name, &from, nl)) { total = -EFAULT; goto out; }
-            m->namelen = sizeof from;
+            m->namelen = fl;
         }
         m->controllen = 0;
         m->flags = mflags;
@@ -2708,10 +2710,10 @@ static int64_t sock_name(uint64_t fd, uint64_t addr, uint64_t lenp, bool peer)
     struct sockaddr_un tmp;
     uint32_t got = sizeof tmp;
     if (inet_is(f)) {
-        struct sockaddr_in sin;
+        union inet_sa sin;
         rc = inet_name(f, peer, &sin);
         memcpy(&tmp, &sin, sizeof sin);
-        got = sizeof sin;
+        got = inet_sa_len(&sin);
     } else if (xsock_is(f)) rc = xsock_name(f, peer, &tmp, &got);
     else rc = usock_name(f, peer, &tmp, &got);
     fput(f);
@@ -4060,7 +4062,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     /* sockets: the network stack's lock (net/core.c, net_lock) or the unix
      * sockets' (fs/unixsock.c). Their data calls, polls and ioctls go by
      * fd_nolock above. */
-    case SYS_socket:         return f->rdi == AF_INET || f->rdi == AF_UNIX;
+    case SYS_socket:         return f->rdi == AF_INET || f->rdi == AF_INET6 || f->rdi == AF_UNIX;
     case SYS_socketpair:     return true;
     case SYS_bind: case SYS_listen: case SYS_connect: case SYS_accept: case SYS_accept4:
     case SYS_shutdown: case SYS_getsockname: case SYS_getpeername: case SYS_setsockopt: case SYS_getsockopt:
