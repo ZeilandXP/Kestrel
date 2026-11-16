@@ -37,6 +37,7 @@
 #include <netinet/if_ether.h>
 
 static int failures;
+static const char *nif = "eth0";        /* the card the remote checks use: eth0, else usb0 (USB tethering) */
 #define CHECK(c, what) do { int ok_ = (c); printf("nettest:  %s  %s\n", ok_ ? "ok  " : "FAIL", what); \
                             if (!ok_) { failures++; printf("nettest:        (errno %d: %s)\n", errno, strerror(errno)); } } while (0)
 
@@ -325,14 +326,14 @@ static void test_netlink(void)
     close(p);
 }
 
-/* On eth0, while pinging the gateway: an ICMP-only filter sees the reply,
+/* On the card, while pinging the gateway: an ICMP-only filter sees the reply,
  * ETH_P_ALL sees our request going out */
 static void test_packet_remote(const char *gw)
 {
-    int ifindex = (int)if_nametoindex("eth0");
+    int ifindex = (int)if_nametoindex(nif);
     int ip = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP)), all = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     struct sockaddr_ll a = { .sll_family = AF_PACKET, .sll_protocol = htons(ETH_P_IP), .sll_ifindex = ifindex };
-    CHECK(ip >= 0 && bind(ip, (struct sockaddr *)&a, sizeof a) == 0, "packet socket bound to eth0, ETH_P_IP");
+    CHECK(ip >= 0 && bind(ip, (struct sockaddr *)&a, sizeof a) == 0, "packet socket bound to the card, ETH_P_IP");
     struct sock_filter icmp[] = {
         { BPF_LD | BPF_B | BPF_ABS, 0, 0, 9 },          /* the IP protocol */
         { BPF_JMP | BPF_JEQ | BPF_K, 0, 1, IPPROTO_ICMP },
@@ -746,7 +747,8 @@ static int wait_for_dhcp(char *addr, size_t cap)
     struct ifreq r;
     for (int i = 0; i < 150; i++) {
         memset(&r, 0, sizeof r);
-        strcpy(r.ifr_name, "eth0");
+        strcpy(r.ifr_name, nif);
+        if (!if_nametoindex("eth0") && if_nametoindex("usb0")) strcpy(r.ifr_name, nif = "usb0");
         if (ioctl(s, SIOCGIFADDR, &r) == 0) {
             inet_ntop(AF_INET, &((struct sockaddr_in *)&r.ifr_addr)->sin_addr, addr, (socklen_t)cap);
             close(s);
@@ -807,15 +809,15 @@ static void test_remote(const char *hostport)
     int port = colon ? atoi(colon + 1) : 7;
     if (colon) *colon = 0;
     char addr[32] = "";
-    CHECK(wait_for_dhcp(addr, sizeof addr) == 0, "eth0 has an address (DHCP)");
-    printf("nettest:        eth0 is %s\n", addr);
+    CHECK(wait_for_dhcp(addr, sizeof addr) == 0, "the card has an address (DHCP)");
+    printf("nettest:        %s is %s\n", nif, addr);
     char rbuf[512];
     int fd = open("/proc/net/route", O_RDONLY);
     ssize_t n = fd >= 0 ? read(fd, rbuf, sizeof rbuf - 1) : -1;
     if (n > 0) rbuf[n] = 0;
-    int dflt = 0;                                       /* a line "ethN<TAB>00000000<TAB>..." */
+    int dflt = 0;                                       /* a line "eth0<TAB>00000000<TAB>..." */
     for (char *l = n > 0 ? rbuf : NULL; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL)
-        if (!strncmp(l, "eth", 3) && strstr(l, "\t00000000\t") == strchr(l, '\t')) dflt = 1;
+        if (!strncmp(l, nif, strlen(nif)) && strstr(l, "\t00000000\t") == strchr(l, '\t')) dflt = 1;
     CHECK(dflt, "/proc/net/route has a default route");
     if (fd >= 0) close(fd);
     test_ping(host);

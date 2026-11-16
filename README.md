@@ -399,7 +399,7 @@ Not implemented yet: more than one request in flight, multiple queues, discard a
   1. Port reset: USB2 ports through PR; USB3 ports through link training, with a warm-reset fallback.
   2. Enable Slot, then Address Device with an input context (slot plus EP0). Max packet size starts at 8 for low/full speed, 64 for high speed and 512 for SuperSpeed.
   3. Device descriptor (8 bytes, then Evaluate Context if the max packet size differs, then all 18 bytes), and manufacturer/product strings.
-  4. Configuration bundle, then SET_CONFIGURATION.
+  4. Configuration bundle, then SET_CONFIGURATION. Every configuration is read (up to four): the first with a keyboard, mouse or disk in it is taken, and for network devices, which often offer one protocol per configuration, CDC NCM before CDC ECM before RNDIS (`kestrel.usbnet=rndis`, `ecm` or `ncm` prefers one).
   5. For HID boot interfaces: SET_PROTOCOL(boot) and SET_IDLE(0). One Configure Endpoint adds the interrupt-IN endpoints, with the interval converted per speed. Eight report TRBs are kept queued per endpoint.
 - **HID:**
   - Keyboard reports are compared with the previous report to produce press and release events. Caps Lock is tracked, US-layout ASCII is generated, and the driver repeats held keys itself (500 ms, then 30 per second).
@@ -419,7 +419,7 @@ Not implemented yet:
 - devices behind external hubs (route strings, transaction translators)
 - HID report-descriptor parsing for non-boot devices
 - more than one controller
-- isochronous transfers; the only bulk class driver is mass storage (below)
+- isochronous transfers; the bulk class drivers are mass storage (below) and network functions (USB tethering, under Networking)
 
 ## USB boot strapping and storage discovery
 
@@ -1192,13 +1192,20 @@ BusyBox `ifconfig`, `route`, `netstat`, `arp`, `ping`, `nc`, `wget`, `httpd` and
 - **r8169:** the chip version is read from `TxConfig` as Linux does; it decides the receive configuration, the transmit FIFO mode, and whether the PHY is reached through `PHYAR` or (8168G on) the GPHY OCP window. The PLL, the PHY and the RXDV gate are powered back up in case a previous driver shut them down, and the PHY is told to advertise every speed the part has (10/100 half and full, 1000 full, pause) before autonegotiation restarts: firmware and systems that went to sleep with Wake-on-LAN often leave it offering 10 Mbit/s only. The negotiated speed and duplex are logged (`r8169: eth0: link up, 1000 Mbit/s, full duplex`), and `IFF_RUNNING` follows the cable. Energy Efficient Ethernet is not advertised (8168G on), and PCIe power saving is turned off as Linux does (ASPM L0s/L1 on both ends of the card's link, the chip's own ASPM and clock request): both are known to make these chips drop frames. `cat /proc/net/nic` shows what the driver sees: the link, the PHY registers (what was advertised and what the switch offered), whether firmware had ASPM on, and the chip's own counters (missed frames, receive errors, collisions). Rings of 256 descriptors hold more than a whole TCP window at a gigabit; received frames and link changes interrupt by MSI (the old PCI RTL8169s are polled, as Linux keeps them off MSI), and ring overruns are counted as dropped frames. Linux also loads per-version PHY tuning tables, which this driver does not. The 2.5 and 5 gigabit RTL8125/8126 are a different design and are refused with a message.
 - Each card gets a ring of receive and transmit descriptors with 2 KiB buffers (RTL8139: an 8 KiB receive ring and four transmit slots, below 4 GiB). Cards are named `eth0`, `eth1`, ... in the order they are found: virtio-net, e1000, r8169, rtl8139.
 
+**USB tethering** (`drivers/net/usbnet.c`). A phone with USB tethering switched on, a USB Ethernet adapter or a Linux USB gadget becomes `usb0` (then `usb1`, up to four) and gets an address by DHCP like any card; unplugging it takes the link down (`IFF_RUNNING`), and the next device plugged in takes the interface back with its own MAC address and a new lease. Three protocols:
+- **RNDIS**, what Android phones speak: the device is initialised with RNDIS control messages (`INITIALIZE`, queries of the MAC address and frame size, the packet filter), and each frame travels in a 44-byte packet message; several in one transfer are taken apart.
+- **CDC ECM**, plain Ethernet frames (many USB Ethernet adapters, gadgets, some modems): the MAC address comes from the descriptor's string, the data interface's second alternate setting is selected and the packet filter set.
+- **CDC NCM**, frames gathered in 16-bit transfer blocks (newer phones and adapters): the block parameters are read, blocks the device sends are capped at 16 KiB, and the datagrams of each block (chained NDPs too) are delivered; frames go out one per block, placed where the device's divisor and remainder ask.
+
+The xHCI driver keeps sixteen 16 KiB receive transfers queued on the bulk IN endpoint and up to 32 frames in flight on the OUT one; a transfer's completion wakes `netd` at once, and a halted endpoint is reset and restarted by `usbd`. `/proc/net/nic` shows each device's protocol, product name and counters. Tested in QEMU with `-device qemu-xhci -device usb-net` both ways (it offers RNDIS and CDC ECM): `nettest` passes through it, and a device removed and added again from the QEMU monitor comes back as `usb0`. QEMU has no NCM device, so NCM is checked on the build machine by `make test-usbnet` (blocks built and taken apart, malformed ones refused); it has not met a real phone yet. Apple's iPhone tethering protocol is not supported.
+
 **Tests:** `nettest` (in `/boot/bin`) runs 105 checks on loopback:
 - interfaces, `SIOC*` ioctls and `if_nametoindex`;
 - netlink: `getifaddrs`, `if_nameindex`, link and address dumps, `MSG_PEEK | MSG_TRUNC`, errors and acknowledgements, a change heard by an `RTMGRP_LINK` listener; packet sockets: a BPF program that jumps out of bounds is refused;
 - UDP on loopback, including 40 KB fragmented datagrams, `MSG_TRUNC` and ICMP port unreachable (`ECONNREFUSED`);
 - TCP: half-close, RST on unread data, `ECONNREFUSED`, `EADDRINUSE`, non-blocking connect with `epoll`, `/proc/net/tcp`, and 8 MiB echoed through loopback with a checksum;
 - `AF_INET6`: an IPv4 client and an IPv6 one (to `::1`) accepted by one `[::]` listener with their addresses mapped or `::1`, mapped destinations, unreachable IPv6 addresses, `IPV6_V6ONLY` beside an IPv4 listener on the same port, UDP both ways with mapped and `::1` senders, `/proc/net/tcp6` and `udp6`;
-- `nettest HOST:PORT` also waits for DHCP, pings the gateway (as root also through an ICMP-only BPF filter on a packet socket, and watching the request leave on an `ETH_P_ALL` one), echoes 8 MiB of TCP and 20 UDP datagrams through the card with a server on the host, connects an `AF_INET6` socket to the host's v4-mapped address, and checks `/etc/resolv.conf`;
+- `nettest HOST:PORT` also waits for DHCP (on `eth0`, or `usb0` when there is no card), pings the gateway (as root also through an ICMP-only BPF filter on a packet socket, and watching the request leave on an `ETH_P_ALL` one), echoes 8 MiB of TCP and 20 UDP datagrams through the card with a server on the host, connects an `AF_INET6` socket to the host's v4-mapped address, and checks `/etc/resolv.conf`;
 - `nettest serve PORT` takes a connection from the host (QEMU `hostfwd`) and answers with the byte count and checksum.
 
 In QEMU (TCG, no KVM) on loopback: 200 one-byte TCP round trips take about 60 ms and bulk TCP runs at about 11 MiB/s each way; through the card, ping to the host is 2–4 ms and TCP 5–7 MiB/s each way.

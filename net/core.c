@@ -512,6 +512,18 @@ bad:
     return false;
 }
 
+void net_hotplug(struct netif *n)
+{
+    char mode[16] = "dhcp";
+    cmdline_get("kestrel.net", mode, sizeof mode);
+    if (!strcmp(mode, "off")) { kprintf("net: %s left down (kestrel.net=off)\n", n->name); return; }
+    uint64_t f = net_lock();
+    n->flags |= IFF_UP | IFF_BROADCAST | IFF_MULTICAST;
+    net_unlock(f);
+    netif_carrier(n, !n->link_up || n->link_up(n));
+    dhcp_start(n);
+}
+
 void net_init(void)
 {
     strlcpy(lo.name, "lo", sizeof lo.name);

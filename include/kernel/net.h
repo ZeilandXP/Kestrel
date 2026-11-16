@@ -121,6 +121,8 @@ void virtio_net_probe(void);
 void e1000_probe(void);
 void rtl8139_probe(void);
 void rtl8169_probe(void);
+void usbnet_scan(void);                 /* drivers/net/usbnet.c: USB tethering; the usbd thread */
+void net_hotplug(struct netif *nif);    /* a card that came after boot: up, and DHCP (as net_init) */
 
 /* ---- routing ---------------------------------------------------------------- */
 struct route { uint32_t dst, mask, gw; struct netif *nif; bool used; };
